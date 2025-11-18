@@ -38,3 +38,7 @@ Thumbs.db
 # Logs
 *.log
 
+# Cookies (민감한 정보)
+cookies.txt
+*.cookies
+

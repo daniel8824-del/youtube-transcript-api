@@ -316,10 +316,41 @@ YouTube의 429 (Too Many Requests) 및 봇 감지 오류를 자동으로 처리�
    export YOUTUBE_COOKIES_FILE=/path/to/cookies.txt
    ```
 
-3. **Railway 환경 변수**:
-   - Railway 대시보드 → Variables
-   - `YOUTUBE_COOKIES_FILE` = `/app/cookies.txt`
-   - 쿠키 파일을 프로젝트에 포함하거나 Railway Secrets로 업로드
+3. **Railway 환경 변수 설정**:
+   
+   **방법 1: Railway 대시보드에서 설정**
+   1. Railway 대시보드에서 프로젝트 선택
+   2. 프로젝트 → **Variables** 탭 클릭
+   3. **New Variable** 버튼 클릭
+   4. 변수 이름: `YOUTUBE_COOKIES_FILE`
+   5. 변수 값: `/app/cookies.txt` (또는 쿠키 파일의 실제 경로)
+   6. **Add** 클릭
+   
+   **방법 2: 쿠키 파일 업로드**
+   
+   쿠키 파일을 프로젝트에 포함하려면:
+   1. 쿠키 파일을 프로젝트 루트에 `cookies.txt`로 저장
+   2. Dockerfile에서 쿠키 파일 복사:
+   ```dockerfile
+   COPY cookies.txt /app/cookies.txt
+   ```
+   3. Railway 환경 변수: `YOUTUBE_COOKIES_FILE=/app/cookies.txt`
+   
+   **방법 3: 쿠키 파일을 프로젝트에 포함 (권장)**
+   
+   쿠키 파일을 Docker 이미지에 포함:
+   1. 쿠키 파일을 프로젝트 루트에 `cookies.txt`로 저장
+   2. `.gitignore`에 `cookies.txt` 추가 (보안)
+   3. Dockerfile 수정:
+   ```dockerfile
+   # 쿠키 파일 복사 (선택적)
+   COPY cookies.txt /app/cookies.txt
+   ```
+   4. Railway 환경 변수 설정:
+      - 변수 이름: `YOUTUBE_COOKIES_FILE`
+      - 변수 값: `/app/cookies.txt`
+   
+   **주의**: 쿠키 파일은 민감한 정보이므로 `.gitignore`에 추가하여 Git에 커밋하지 마세요!
 
 ## Railway 배포 (Docker)
 
