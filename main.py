@@ -11,6 +11,7 @@ import requests
 import logging
 import time
 import re
+import os
 
 # 로깅 설정
 logging.basicConfig(
@@ -94,6 +95,44 @@ class VideoResponse(BaseModel):
 
 # ===== 유틸리티 함수 =====
 
+def get_ydl_opts_base() -> dict:
+    """
+    yt-dlp 기본 옵션 (봇 감지 방지)
+    환경 변수 YOUTUBE_COOKIES_FILE이 설정되어 있으면 쿠키 사용
+    """
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': False,
+        'skip_download': True,
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'http_headers': {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Referer': 'https://www.youtube.com/',
+            'Origin': 'https://www.youtube.com'
+        },
+        'retries': 3,
+        'fragment_retries': 3,
+        'socket_timeout': 30,
+    }
+    
+    # 환경 변수에서 쿠키 파일 경로 확인
+    cookies_file = os.getenv('YOUTUBE_COOKIES_FILE')
+    if cookies_file and os.path.exists(cookies_file):
+        opts['cookiefile'] = cookies_file
+        logger.info(f"쿠키 파일 사용: {cookies_file}")
+    
+    return opts
+
 def extract_video_id(url: str) -> str:
     """URL에서 video_id 추출"""
     if "youtu.be/" in url:
@@ -103,33 +142,28 @@ def extract_video_id(url: str) -> str:
     else:
         return url
 
-def get_video_info(video_url: str) -> Dict[str, Any]:
-    """yt-dlp로 영상 정보 추출"""
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': False,
-        'skip_download': True,
-        'writesubtitles': True,  # 자막 정보 포함
-        'writeautomaticsub': True,  # 자동 자막 정보 포함
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'http_headers': {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Accept-Encoding': 'gzip, deflate',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
-        },
-        'retries': 3,
-        'fragment_retries': 3,
-        'socket_timeout': 30,
-    }
+def get_video_info(video_url: str, max_retries: int = 3) -> Dict[str, Any]:
+    """
+    yt-dlp로 영상 정보 추출
+    봇 감지 오류 시 재시도
+    """
+    for attempt in range(max_retries):
+        try:
+            ydl_opts = get_ydl_opts_base()
+            ydl_opts.update({
+                'writesubtitles': True,  # 자막 정보 포함
+                'writeautomaticsub': True,  # 자동 자막 정보 포함
+            })
+            
+            # 재시도 시 딜레이
+            if attempt > 0:
+                wait_time = min(2 ** attempt, 10)
+                logger.info(f"영상 정보 추출 재시도 {attempt}/{max_retries-1} - {wait_time}초 대기...")
+                time.sleep(wait_time)
     
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            logger.info(f"영상 정보 추출 중: {video_url}")
-            info = ydl.extract_info(video_url, download=False)
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                logger.info(f"영상 정보 추출 중: {video_url}")
+                info = ydl.extract_info(video_url, download=False)
             
             # duration을 "MM:SS" 형식으로 변환
             duration_string = None
@@ -185,7 +219,7 @@ def get_video_info(video_url: str) -> Dict[str, Any]:
                                 })
                                 break
             
-            return {
+            result = {
                 # 기본 정보
                 'video_id': info.get('id'),
                 'title': info.get('title'),
@@ -219,18 +253,56 @@ def get_video_info(video_url: str) -> Dict[str, Any]:
                 # 자막 URL (간소화)
                 'subtitle_urls': subtitle_urls if subtitle_urls else None
             }
-    except yt_dlp.utils.DownloadError as e:
-        error_msg = str(e)
-        logger.error(f"다운로드 오류: {error_msg}")
-        if "Video unavailable" in error_msg:
-            raise HTTPException(status_code=404, detail="영상을 찾을 수 없거나 접근이 제한되었습니다.")
-        elif "Precondition check failed" in error_msg:
-            raise HTTPException(status_code=429, detail="YouTube에서 일시적으로 요청을 제한했습니다. 잠시 후 다시 시도해주세요.")
-        else:
-            raise HTTPException(status_code=400, detail=f"영상 정보를 가져올 수 없습니다: {error_msg}")
-    except Exception as e:
-        logger.error(f"영상 정보 추출 오류: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"서버 오류: {str(e)}")
+            return result
+                
+        except yt_dlp.utils.DownloadError as e:
+            error_msg = str(e)
+            logger.warning(f"영상 정보 추출 오류 (시도 {attempt+1}/{max_retries}): {error_msg}")
+            
+            # 봇 감지 오류 또는 429 오류 감지
+            if any(keyword in error_msg.lower() for keyword in ['bot', 'sign in', 'cookies', '429', 'too many requests', 'rate limit', 'precondition']):
+                if attempt < max_retries - 1:
+                    continue  # 재시도
+                else:
+                    logger.error(f"영상 정보 추출 실패: 최대 재시도 횟수 초과")
+                    if 'bot' in error_msg.lower() or 'sign in' in error_msg.lower():
+                        raise HTTPException(
+                            status_code=403,
+                            detail="YouTube 봇 감지로 인해 접근이 제한되었습니다. 쿠키 파일을 사용하거나 잠시 후 다시 시도해주세요."
+                        )
+                    else:
+                        raise HTTPException(
+                            status_code=429,
+                            detail="YouTube에서 요청을 제한했습니다. 잠시 후 다시 시도해주세요."
+                        )
+            elif "Video unavailable" in error_msg:
+                raise HTTPException(status_code=404, detail="영상을 찾을 수 없거나 접근이 제한되었습니다.")
+            else:
+                # 다른 오류는 즉시 실패
+                raise HTTPException(status_code=400, detail=f"영상 정보를 가져올 수 없습니다: {error_msg}")
+                
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"영상 정보 추출 오류: {type(e).__name__} - {error_msg}")
+            
+            # 봇 감지 관련 오류인지 확인
+            if any(keyword in error_msg.lower() for keyword in ['bot', 'sign in', 'cookies']):
+                if attempt < max_retries - 1:
+                    continue  # 재시도
+                else:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="YouTube 봇 감지로 인해 접근이 제한되었습니다. 쿠키 파일을 사용하거나 잠시 후 다시 시도해주세요."
+                    )
+            else:
+                raise HTTPException(status_code=500, detail=f"서버 오류: {error_msg}")
+    
+    # 모든 재시도 실패
+    logger.error(f"영상 정보 추출 실패: 최대 재시도 횟수({max_retries}) 초과")
+    raise HTTPException(
+        status_code=403,
+        detail="YouTube 봇 감지로 인해 접근이 제한되었습니다. 쿠키 파일을 사용하거나 잠시 후 다시 시도해주세요."
+    )
 
 def get_transcript(video_id: str, languages: List[str] = ["ko", "en"]) -> Dict[str, Any]:
     """
@@ -242,26 +314,13 @@ def get_transcript(video_id: str, languages: List[str] = ["ko", "en"]) -> Dict[s
     
     video_url = f"https://www.youtube.com/watch?v={video_id}"
     
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'skip_download': True,
+    ydl_opts = get_ydl_opts_base()
+    ydl_opts.update({
         'writesubtitles': True,
         'writeautomaticsub': True,
         'subtitleslangs': languages,
         'subtitlesformat': 'vtt',  # VTT 형식으로 받기
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'http_headers': {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Accept-Encoding': 'gzip, deflate',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
-        },
-        'retries': 3,
-        'socket_timeout': 30,
-    }
+    })
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -447,11 +506,8 @@ def remove_vtt_tags(text: str) -> str:
 def get_comments(video_url: str, max_comments: int = 100) -> Dict[str, Any]:
     """yt-dlp로 댓글 추출 (인기순)"""
     
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': False,
-        'skip_download': True,
+    ydl_opts = get_ydl_opts_base()
+    ydl_opts.update({
         'getcomments': True,  # 댓글 가져오기
         'extractor_args': {
             'youtube': {
@@ -459,18 +515,7 @@ def get_comments(video_url: str, max_comments: int = 100) -> Dict[str, Any]:
                 'comment_sort': ['top']  # 인기순 정렬
             }
         },
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'http_headers': {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Accept-Encoding': 'gzip, deflate',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
-        },
-        'retries': 3,
-        'socket_timeout': 30,
-    }
+    })
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:

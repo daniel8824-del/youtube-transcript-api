@@ -292,12 +292,34 @@ http://localhost:8000/test-comments/dQw4w9WgXcQ?max_comments=50
 
 기존 `youtube-transcript-api`는 클라우드 IP를 차단하는 문제가 있었으나, `yt-dlp`로 전환하여 해결했습니다.
 
-### Rate Limiting 처리
+### Rate Limiting 및 봇 감지 처리
 
-YouTube의 429 (Too Many Requests) 오류를 자동으로 처리합니다:
-- **자동 재시도**: 최대 3회 재시도 (exponential backoff)
+YouTube의 429 (Too Many Requests) 및 봇 감지 오류를 자동으로 처리합니다:
+- **자동 재시도**: 최대 3회 재시도 (exponential backoff: 2초 → 4초 → 최대 10초)
 - **요청 딜레이**: 자막 다운로드 전 0.5초, 배치 처리 시 1초 대기
-- **HTTP 헤더 최적화**: 브라우저 요청과 유사한 헤더 사용
+- **HTTP 헤더 최적화**: 최신 브라우저와 유사한 헤더 사용 (Chrome 131, Sec-Fetch-* 헤더 포함)
+- **쿠키 지원**: 환경 변수 `YOUTUBE_COOKIES_FILE`로 쿠키 파일 경로 지정 가능
+
+#### 쿠키 파일 사용 (선택사항)
+
+봇 감지가 심한 경우 쿠키 파일을 사용할 수 있습니다:
+
+1. **쿠키 파일 생성**:
+   ```bash
+   # 브라우저 확장 프로그램 사용 (예: Get cookies.txt LOCALLY)
+   # 또는 yt-dlp로 쿠키 내보내기
+   yt-dlp --cookies-from-browser chrome
+   ```
+
+2. **환경 변수 설정**:
+   ```bash
+   export YOUTUBE_COOKIES_FILE=/path/to/cookies.txt
+   ```
+
+3. **Railway 환경 변수**:
+   - Railway 대시보드 → Variables
+   - `YOUTUBE_COOKIES_FILE` = `/app/cookies.txt`
+   - 쿠키 파일을 프로젝트에 포함하거나 Railway Secrets로 업로드
 
 ## Railway 배포 (Docker)
 
