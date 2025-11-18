@@ -120,6 +120,7 @@ def get_ydl_opts_base() -> dict:
     """
     yt-dlp 기본 옵션 (봇 감지 방지)
     환경 변수 YOUTUBE_COOKIES_FILE이 설정되어 있으면 쿠키 사용
+    환경 변수 SCRAPERAPI_KEY가 설정되어 있으면 ScraperAPI 프록시 사용
     """
     opts = {
         'quiet': True,
@@ -160,6 +161,14 @@ def get_ydl_opts_base() -> dict:
     if cookies_file and os.path.exists(cookies_file):
         opts['cookiefile'] = cookies_file
         logger.info(f"쿠키 파일 사용: {cookies_file}")
+    
+    # ScraperAPI 프록시 설정 (환경 변수 또는 직접 설정)
+    scraperapi_key = os.getenv('SCRAPERAPI_KEY')
+    if scraperapi_key:
+        # ScraperAPI 프록시 URL 형식: http://scraperapi:API_KEY@proxy-server.scraperapi.com:8001
+        proxy_url = f"http://scraperapi:{scraperapi_key}@proxy-server.scraperapi.com:8001"
+        opts['proxy'] = proxy_url
+        logger.info("ScraperAPI 프록시 사용 (429 오류 및 봇 감지 우회)")
     
     return opts
 
@@ -360,61 +369,72 @@ def get_transcript(video_id: str, languages: List[str] = ["ko"]) -> Dict[str, An
     """
     logger.info(f"자막 추출 시도: {video_id}, 선호 언어: {languages}")
     
-    # 1. youtube-transcript-api 시도 (우선)
-    if YOUTUBE_TRANSCRIPT_AVAILABLE:
-        try:
-            logger.info("youtube-transcript-api로 자막 추출 시도...")
-            ytt_api = YouTubeTranscriptApi()
-            transcript_list = ytt_api.list(video_id)
-            
-            # 원하는 언어의 자막 찾기
-            transcript = transcript_list.find_transcript(languages)
-            fetched_transcript = transcript.fetch()
-            
-            # 자막 텍스트 결합
-            full_text = " ".join([snippet.text for snippet in fetched_transcript])
-            
-            # transcript_list 변환 (타임스탬프 포함)
-            transcript_with_time = [
-                {
-                    'text': snippet.text,
-                    'start': snippet.start,
-                    'duration': snippet.duration
-                }
-                for snippet in fetched_transcript
-            ]
-            
-            logger.info(f"자막 추출 성공 (youtube-transcript-api): {transcript.language} ({transcript.language_code}), {len(fetched_transcript)}개 구간")
-            
-            return {
-                'transcript': full_text,
-                'language': transcript.language,
-                'language_code': transcript.language_code,
-                'is_generated': transcript.is_generated,
-                'snippet_count': len(fetched_transcript),
-                'transcript_list': transcript_with_time
-            }
-            
-        except (NoTranscriptFound, TranscriptsDisabled, VideoUnavailable) as e:
-            logger.warning(f"youtube-transcript-api 실패: {type(e).__name__}, yt-dlp로 폴백...")
-            # yt-dlp로 폴백
-        except Exception as e:
-            logger.warning(f"youtube-transcript-api 오류: {str(e)}, yt-dlp로 폴백...")
-            # yt-dlp로 폴백
-    
-    # 2. yt-dlp로 폴백 (클라우드 환경 또는 youtube-transcript-api 실패 시)
-    logger.info("yt-dlp로 자막 추출 시도...")
-    video_url = f"https://www.youtube.com/watch?v={video_id}"
-    
-    ydl_opts = get_ydl_opts_base()
-    ydl_opts.update({
-        'writesubtitles': True,
-        'writeautomaticsub': True,
-        'subtitleslangs': languages,
-        'subtitlesformat': 'vtt',  # VTT 형식으로 받기
-    })
+    # ScraperAPI 프록시 설정 (youtube-transcript-api도 requests를 사용하므로 환경 변수로 설정)
+    scraperapi_key = os.getenv('SCRAPERAPI_KEY')
+    proxy_set = False
+    if scraperapi_key:
+        proxy_url = f"http://scraperapi:{scraperapi_key}@proxy-server.scraperapi.com:8001"
+        # requests 라이브러리가 사용하는 환경 변수 설정 (youtube-transcript-api도 내부적으로 requests 사용)
+        os.environ['HTTP_PROXY'] = proxy_url
+        os.environ['HTTPS_PROXY'] = proxy_url
+        proxy_set = True
+        logger.info("ScraperAPI 프록시 사용 (youtube-transcript-api)")
     
     try:
+        # 1. youtube-transcript-api 시도 (우선)
+        if YOUTUBE_TRANSCRIPT_AVAILABLE:
+            try:
+                logger.info("youtube-transcript-api로 자막 추출 시도...")
+                ytt_api = YouTubeTranscriptApi()
+                transcript_list = ytt_api.list(video_id)
+                
+                # 원하는 언어의 자막 찾기
+                transcript = transcript_list.find_transcript(languages)
+                fetched_transcript = transcript.fetch()
+                
+                # 자막 텍스트 결합
+                full_text = " ".join([snippet.text for snippet in fetched_transcript])
+                
+                # transcript_list 변환 (타임스탬프 포함)
+                transcript_with_time = [
+                    {
+                        'text': snippet.text,
+                        'start': snippet.start,
+                        'duration': snippet.duration
+                    }
+                    for snippet in fetched_transcript
+                ]
+                
+                logger.info(f"자막 추출 성공 (youtube-transcript-api): {transcript.language} ({transcript.language_code}), {len(fetched_transcript)}개 구간")
+                
+                return {
+                    'transcript': full_text,
+                    'language': transcript.language,
+                    'language_code': transcript.language_code,
+                    'is_generated': transcript.is_generated,
+                    'snippet_count': len(fetched_transcript),
+                    'transcript_list': transcript_with_time
+                }
+                
+            except (NoTranscriptFound, TranscriptsDisabled, VideoUnavailable) as e:
+                logger.warning(f"youtube-transcript-api 실패: {type(e).__name__}, yt-dlp로 폴백...")
+                # yt-dlp로 폴백
+            except Exception as e:
+                logger.warning(f"youtube-transcript-api 오류: {str(e)}, yt-dlp로 폴백...")
+                # yt-dlp로 폴백
+        
+        # 2. yt-dlp로 폴백 (클라우드 환경 또는 youtube-transcript-api 실패 시)
+        logger.info("yt-dlp로 자막 추출 시도...")
+        video_url = f"https://www.youtube.com/watch?v={video_id}"
+        
+        ydl_opts = get_ydl_opts_base()
+        ydl_opts.update({
+            'writesubtitles': True,
+            'writeautomaticsub': True,
+            'subtitleslangs': languages,
+            'subtitlesformat': 'vtt',  # VTT 형식으로 받기
+        })
+        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=False)
             
@@ -462,14 +482,20 @@ def get_transcript(video_id: str, languages: List[str] = ["ko"]) -> Dict[str, An
             return {'transcript': None, 'language': None, 'language_code': None, 'error': '자막 없음'}
             
     except Exception as e:
-        logger.error(f"자막 추출 오류 (yt-dlp): {type(e).__name__} - {str(e)}")
+        logger.error(f"자막 추출 오류: {type(e).__name__} - {str(e)}")
         return {'transcript': None, 'language': None, 'language_code': None, 'error': str(e)}
+    finally:
+        # 환경 변수 정리 (다른 요청에 영향을 주지 않도록)
+        if proxy_set:
+            os.environ.pop('HTTP_PROXY', None)
+            os.environ.pop('HTTPS_PROXY', None)
 
 
 def download_subtitle_vtt(url: str, max_retries: int = 3) -> dict:
     """
     VTT 형식의 자막 URL에서 텍스트 및 타임스탬프 추출
     429 오류 시 exponential backoff로 재시도
+    ScraperAPI 프록시 지원
     """
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -479,6 +505,18 @@ def download_subtitle_vtt(url: str, max_retries: int = 3) -> dict:
         'Origin': 'https://www.youtube.com'
     }
     
+    # ScraperAPI 프록시 설정 (환경 변수)
+    proxies = None
+    scraperapi_key = os.getenv('SCRAPERAPI_KEY')
+    if scraperapi_key:
+        # ScraperAPI 프록시 URL 형식: http://scraperapi:API_KEY@proxy-server.scraperapi.com:8001
+        proxy_url = f"http://scraperapi:{scraperapi_key}@proxy-server.scraperapi.com:8001"
+        proxies = {
+            'http': proxy_url,
+            'https': proxy_url
+        }
+        logger.info("ScraperAPI 프록시 사용 (자막 다운로드)")
+    
     for attempt in range(max_retries):
         try:
             # 재시도 시 딜레이 (exponential backoff)
@@ -487,7 +525,7 @@ def download_subtitle_vtt(url: str, max_retries: int = 3) -> dict:
                 logger.info(f"429 오류 재시도 {attempt}/{max_retries-1} - {wait_time}초 대기...")
                 time.sleep(wait_time)
             
-            response = requests.get(url, headers=headers, timeout=15)
+            response = requests.get(url, headers=headers, proxies=proxies, timeout=15)
             
             # 429 오류 처리
             if response.status_code == 429:

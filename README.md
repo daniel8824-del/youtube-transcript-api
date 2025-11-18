@@ -544,6 +544,15 @@ git push origin main
 
 #### 3. 환경 변수 설정 (선택사항)
 
+**ScraperAPI 프록시 사용 (권장 - 429 오류 및 봇 감지 우회):**
+- Railway 대시보드 → 프로젝트 → **Variables** 탭
+- **New Variable** 클릭
+- **Name**: `SCRAPERAPI_KEY`
+- **Value**: `your_scraperapi_key_here` (예: `4383f1de116db25e8ae597e447a72752`)
+- **Add** 클릭
+
+**참고**: Railway의 TCP Proxy 기능은 외부 프록시 서버를 연결하는 것이며, ScraperAPI는 환경 변수로 설정하면 코드에서 자동으로 프록시가 적용됩니다.
+
 **쿠키 파일 사용 시:**
 - Railway 대시보드 → 프로젝트 → **Variables** 탭
 - **New Variable** 클릭
