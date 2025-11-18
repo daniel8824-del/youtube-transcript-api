@@ -292,6 +292,46 @@ http://localhost:8000/test-comments/dQw4w9WgXcQ?max_comments=50
 
 기존 `youtube-transcript-api`는 클라우드 IP를 차단하는 문제가 있었으나, `yt-dlp`로 전환하여 해결했습니다.
 
+## Railway 배포 (Docker)
+
+Railway에서 Dockerfile을 사용하여 배포하면 mise 패키지 관리자 문제를 우회할 수 있습니다.
+
+### 배포 방법
+
+1. **GitHub 저장소 연결**
+   - Railway 대시보드에서 "New Project" 선택
+   - "Deploy from GitHub repo" 선택
+   - 저장소 연결
+
+2. **자동 배포**
+   - Railway가 Dockerfile을 자동으로 감지
+   - Docker 이미지 빌드 및 배포 자동 실행
+   - PORT 환경 변수 자동 설정
+
+3. **배포 확인**
+   - Railway 대시보드에서 생성된 URL 확인
+   - `https://your-app.railway.app/health` 접속하여 상태 확인
+
+### Dockerfile 특징
+
+- Python 3.11 기반
+- ffmpeg 포함 (yt-dlp 필수)
+- Railway PORT 환경 변수 자동 사용
+- 최적화된 레이어 캐싱
+
+### 로컬 Docker 테스트
+
+```bash
+# 이미지 빌드
+docker build -t youtube-extractor .
+
+# 컨테이너 실행
+docker run -p 8000:8000 youtube-extractor
+
+# 또는 docker-compose 사용
+docker-compose up
+```
+
 ## 주의사항
 
 - 일부 영상은 자막이 없거나 추출이 제한될 수 있습니다.
