@@ -1,5 +1,5 @@
 """
-YouTube 영상 정보 + 자막 추출 API (youtube-transcript-api 최신 버전)
+YouTube 영상 정보 + 자막 추출 API (yt-dlp 사용 - 클라우드 환경 지원)
 """
 
 from fastapi import FastAPI, HTTPException
@@ -7,14 +7,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import yt_dlp
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import (
-    TranscriptsDisabled, 
-    NoTranscriptFound,
-    VideoUnavailable
-)
+import requests
 import logging
 import time
+import re
 
 # 로깅 설정
 logging.basicConfig(
@@ -238,122 +234,170 @@ def get_video_info(video_url: str) -> Dict[str, Any]:
 
 def get_transcript(video_id: str, languages: List[str] = ["ko", "en"]) -> Dict[str, Any]:
     """
-    youtube-transcript-api 최신 버전으로 자막 추출
+    yt-dlp로 자막 추출 (클라우드 환경에서도 작동)
     
-    변경사항:
-    - YouTubeTranscriptApi() 인스턴스 생성
-    - list() 메서드로 사용 가능한 자막 확인
-    - find_transcript() 메서드로 원하는 언어의 자막 찾기
-    - fetch() 메서드로 자막 가져오기
+    youtube-transcript-api는 Railway 같은 클라우드 IP를 차단하므로 yt-dlp 사용
     """
-    logger.info(f"자막 추출 시도: {video_id}, 언어: {languages}")
+    logger.info(f"자막 추출 시도: {video_id}, 선호 언어: {languages}")
+    
+    video_url = f"https://www.youtube.com/watch?v={video_id}"
+    
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'skip_download': True,
+        'writesubtitles': True,
+        'writeautomaticsub': True,
+        'subtitleslangs': languages,
+        'subtitlesformat': 'vtt',  # VTT 형식으로 받기
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'http_headers': {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Accept-Encoding': 'gzip, deflate',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
+        },
+        'retries': 3,
+        'socket_timeout': 30,
+    }
     
     try:
-        # 1. YouTubeTranscriptApi 인스턴스 생성
-        ytt_api = YouTubeTranscriptApi()
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+            
+            # 자막 데이터 추출
+            subtitles = info.get('subtitles', {})
+            automatic_captions = info.get('automatic_captions', {})
+            
+            # 사용 가능한 자막 언어 로그
+            available_langs = list(subtitles.keys()) + list(automatic_captions.keys())
+            logger.info(f"사용 가능한 자막: {', '.join(set(available_langs))}")
+            
+            # 선호 언어 순서대로 확인
+            for lang in languages:
+                # 1. 수동 자막 우선
+                if lang in subtitles:
+                    subtitle_data = subtitles[lang]
+                    for sub in subtitle_data:
+                        if 'vtt' in sub.get('ext', ''):
+                            result = download_subtitle_vtt(sub['url'])
+                            if result:
+                                logger.info(f"자막 추출 성공: {lang} (수동 자막), {len(result['transcript'])}자, {result['snippet_count']}개 구간")
+                                result['language'] = lang
+                                result['language_code'] = lang
+                                result['is_generated'] = False
+                                return result
+                
+                # 2. 자동 생성 자막
+                if lang in automatic_captions:
+                    caption_data = automatic_captions[lang]
+                    for cap in caption_data:
+                        if 'vtt' in cap.get('ext', ''):
+                            result = download_subtitle_vtt(cap['url'])
+                            if result:
+                                logger.info(f"자막 추출 성공: {lang} (자동 생성), {len(result['transcript'])}자, {result['snippet_count']}개 구간")
+                                result['language'] = lang
+                                result['language_code'] = lang
+                                result['is_generated'] = True
+                                return result
+            
+            logger.warning(f"요청한 언어의 자막을 찾을 수 없음: {languages}")
+            return {'transcript': None, 'language': None, 'language_code': None, 'error': '자막 없음'}
+            
+    except Exception as e:
+        logger.error(f"자막 추출 오류: {type(e).__name__} - {str(e)}")
+        return {'transcript': None, 'language': None, 'language_code': None, 'error': str(e)}
+
+
+def download_subtitle_vtt(url: str) -> dict:
+    """VTT 형식의 자막 URL에서 텍스트 및 타임스탬프 추출"""
+    try:
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
         
-        # 2. 사용 가능한 자막 목록 가져오기
-        transcript_list = ytt_api.list(video_id)
+        vtt_content = response.text
         
-        # 사용 가능한 자막 언어 로그
-        available_langs = []
-        for trans in transcript_list:
-            available_langs.append(f"{trans.language} ({trans.language_code})")
-        logger.info(f"사용 가능한 자막: {', '.join(available_langs)}")
+        # VTT 파싱
+        texts = []
+        transcript_list = []
+        lines = vtt_content.split('\n')
         
-        # 3. 원하는 언어의 자막 찾기
-        transcript = transcript_list.find_transcript(languages)
-        
-        logger.info(f"자막 다운로드 시도: 언어={transcript.language_code}")
-        
-        # 4. 자막 데이터 가져오기
-        fetched_transcript = transcript.fetch()
-        
-        # 5. 자막 텍스트 결합
-        full_text = " ".join([snippet.text for snippet in fetched_transcript])
-        
-        # 6. transcript_list 변환 (타임스탬프 포함)
-        transcript_with_time = [
-            {
-                'text': snippet.text,
-                'start': snippet.start,
-                'duration': snippet.duration
-            }
-            for snippet in fetched_transcript
-        ]
-        
-        logger.info(f"자막 추출 성공: {transcript.language} ({transcript.language_code}), {len(fetched_transcript)}개 구간, {len(full_text)}자")
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            
+            # 타임스탬프 라인 찾기 (00:00:00.000 --> 00:00:02.000)
+            if '-->' in line:
+                try:
+                    # 타임스탬프 파싱
+                    time_parts = line.split('-->')
+                    start_time_str = time_parts[0].strip().split(' ')[0]  # align 제거
+                    end_time_str = time_parts[1].strip().split(' ')[0]
+                    
+                    # 시간을 초로 변환
+                    start_seconds = parse_vtt_time(start_time_str)
+                    end_seconds = parse_vtt_time(end_time_str)
+                    duration = end_seconds - start_seconds
+                    
+                    # 다음 라인들에서 자막 텍스트 추출
+                    i += 1
+                    subtitle_text = []
+                    while i < len(lines) and lines[i].strip() and '-->' not in lines[i]:
+                        text = lines[i].strip()
+                        # HTML 태그 제거 (예: <c> 태그)
+                        text = remove_vtt_tags(text)
+                        if text:
+                            subtitle_text.append(text)
+                        i += 1
+                    
+                    if subtitle_text:
+                        full_text = ' '.join(subtitle_text)
+                        texts.append(full_text)
+                        transcript_list.append({
+                            'text': full_text,
+                            'start': start_seconds,
+                            'duration': duration
+                        })
+                except Exception as e:
+                    logger.warning(f"VTT 라인 파싱 실패: {line} - {str(e)}")
+                    i += 1
+            else:
+                i += 1
         
         return {
-            'transcript': full_text,
-            'language': transcript.language,
-            'language_code': transcript.language_code,
-            'is_generated': transcript.is_generated,
-            'snippet_count': len(fetched_transcript),
-            'transcript_list': transcript_with_time
+            'transcript': " ".join(texts),
+            'snippet_count': len(transcript_list),
+            'transcript_list': transcript_list
         }
         
-    except NoTranscriptFound:
-        # 수동 생성 자막만 시도
-        try:
-            logger.info("수동 생성 자막만 검색 중...")
-            transcript = transcript_list.find_manually_created_transcript(languages)
-            fetched_transcript = transcript.fetch()
-            full_text = " ".join([snippet.text for snippet in fetched_transcript])
-            
-            transcript_with_time = [
-                {'text': snippet.text, 'start': snippet.start, 'duration': snippet.duration}
-                for snippet in fetched_transcript
-            ]
-            
-            logger.info(f"수동 자막 추출 성공: {transcript.language}")
-            return {
-                'transcript': full_text,
-                'language': transcript.language,
-                'language_code': transcript.language_code,
-                'is_generated': False,
-                'snippet_count': len(fetched_transcript),
-                'transcript_list': transcript_with_time
-            }
-        except:
-            pass
-        
-        # 자동 생성 자막만 시도
-        try:
-            logger.info("자동 생성 자막만 검색 중...")
-            transcript = transcript_list.find_generated_transcript(languages)
-            fetched_transcript = transcript.fetch()
-            full_text = " ".join([snippet.text for snippet in fetched_transcript])
-            
-            transcript_with_time = [
-                {'text': snippet.text, 'start': snippet.start, 'duration': snippet.duration}
-                for snippet in fetched_transcript
-            ]
-            
-            logger.info(f"자동 자막 추출 성공: {transcript.language}")
-            return {
-                'transcript': full_text,
-                'language': transcript.language,
-                'language_code': transcript.language_code,
-                'is_generated': True,
-                'snippet_count': len(fetched_transcript),
-                'transcript_list': transcript_with_time
-            }
-        except Exception as e:
-            logger.warning(f"자막 없음: {video_id}")
-            return {'transcript': None, 'language': None, 'language_code': None, 'error': '자막 없음'}
-    
-    except TranscriptsDisabled:
-        logger.warning(f"자막 비활성화: {video_id}")
-        return {'transcript': None, 'language': None, 'language_code': None, 'error': '자막 비활성화'}
-    
-    except VideoUnavailable:
-        logger.error(f"영상 접근 불가: {video_id}")
-        return {'transcript': None, 'language': None, 'language_code': None, 'error': '영상 접근 불가'}
-    
     except Exception as e:
-        logger.error(f"자막 추출 중 오류: {type(e).__name__} - {str(e)}")
-        return {'transcript': None, 'language': None, 'language_code': None, 'error': str(e)}
+        logger.error(f"VTT 다운로드 오류: {str(e)}")
+        return None
+
+
+def parse_vtt_time(time_str: str) -> float:
+    """VTT 시간 형식을 초로 변환 (00:00:00.000)"""
+    try:
+        parts = time_str.split(':')
+        hours = int(parts[0])
+        minutes = int(parts[1])
+        seconds = float(parts[2])
+        return hours * 3600 + minutes * 60 + seconds
+    except:
+        return 0.0
+
+
+def remove_vtt_tags(text: str) -> str:
+    """VTT 태그 제거 (예: <c>, <00:00:01.234> 등)"""
+    # <00:00:01.234> 형식의 타임스탬프 제거
+    text = re.sub(r'<\d+:\d+:\d+\.\d+>', '', text)
+    # <c> 태그 제거
+    text = re.sub(r'</?c[^>]*>', '', text)
+    # 기타 HTML 태그 제거
+    text = re.sub(r'<[^>]+>', '', text)
+    return text.strip()
 
 def get_comments(video_url: str, max_comments: int = 100) -> Dict[str, Any]:
     """yt-dlp로 댓글 추출 (인기순)"""
