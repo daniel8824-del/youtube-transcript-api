@@ -1,32 +1,33 @@
-# YouTube 정보 추출 API
+# YouTube Data Extraction API
 
-유튜브 URL에서 상세 정보와 자막을 추출하는 FastAPI 서버입니다.
+FastAPI 기반 YouTube 데이터 추출 API입니다. 영상 정보, 자막, 댓글을 손쉽게 추출할 수 있으며, n8n 워크플로우와의 통합을 지원합니다.
 
-## 설치 방법
+## 주요 기능
+
+- 📹 **영상 정보 추출**: 제목, 설명, 조회수, 좋아요, 채널 정보 등
+- 📝 **자막 추출**: VTT 포맷, 타임스탬프 포함, 다국어 지원
+- 💬 **댓글 추출**: 인기순 정렬, 작성자 정보, 좋아요 수
+- ☁️ **클라우드 지원**: Railway, AWS, GCP 등 클라우드 환경에서 안정적으로 작동
+- 🔗 **n8n 통합**: 워크플로우 자동화 지원
+
+## Quick Start
+
+### 1. 설치
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## 실행 방법
-
-```bash
-python main.py
-```
-
-또는
+### 2. 실행
 
 ```bash
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-서버가 실행되면 `http://localhost:8000`에서 접근 가능합니다.
-
-## API 문서
-
-서버 실행 후 다음 URL에서 자동 생성된 API 문서를 확인할 수 있습니다:
-- Swagger UI: `http://localhost:8000/docs`
-- ReDoc: `http://localhost:8000/redoc`
+서버가 실행되면 다음 주소에서 접근 가능합니다:
+- **API 서버**: http://localhost:8000
+- **Swagger UI**: http://localhost:8000/docs
+- **ReDoc**: http://localhost:8000/redoc
 
 ## 엔드포인트
 
@@ -36,24 +37,24 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 **GET** `/test/{video_id}`
 
 ```
-http://localhost:8000/test/H5TAW-0X7eQ
+http://localhost:8000/test/dQw4w9WgXcQ
 ```
 
 언어 지정:
 ```
-http://localhost:8000/test/H5TAW-0X7eQ?languages=ko,en
+http://localhost:8000/test/dQw4w9WgXcQ?languages=ko,en
 ```
 
 #### 댓글 테스트
 **GET** `/test-comments/{video_id}`
 
 ```
-http://localhost:8000/test-comments/H5TAW-0X7eQ
+http://localhost:8000/test-comments/dQw4w9WgXcQ
 ```
 
 개수 지정:
 ```
-http://localhost:8000/test-comments/H5TAW-0X7eQ?max_comments=50
+http://localhost:8000/test-comments/dQw4w9WgXcQ?max_comments=50
 ```
 
 ### 2. 단일 영상 추출
@@ -64,7 +65,7 @@ http://localhost:8000/test-comments/H5TAW-0X7eQ?max_comments=50
 
 ```json
 {
-  "url": "https://www.youtube.com/watch?v=yebNiHkAC4A",
+  "url": "https://www.youtube.com/watch?v={VIDEO_ID}",
   "include_transcript": true,
   "transcript_languages": ["ko", "en"]
 }
@@ -74,24 +75,24 @@ http://localhost:8000/test-comments/H5TAW-0X7eQ?max_comments=50
 
 ```json
 {
-  "video_id": "yebNiHkAC4A",
-  "title": "Golden",
-  "description": "영상 설명...",
+  "video_id": "dQw4w9WgXcQ",
+  "title": "Video Title",
+  "description": "Video description...",
   "duration": 199,
-  "view_count": 741463390,
-  "like_count": 1234567,
-  "channel": "Sony Pictures Animation",
-  "channel_id": "UCzWxTABQvPPYQPXu3KmPx4A",
-  "channel_url": "https://www.youtube.com/@SonyAnimation",
+  "view_count": 1234567,
+  "like_count": 12345,
+  "channel": "Channel Name",
+  "channel_id": "UCxxxxxxxxxx",
+  "channel_url": "https://www.youtube.com/@ChannelName",
   "upload_date": "20231118",
-  "thumbnail": "https://i.ytimg.com/...",
+  "thumbnail": "https://i.ytimg.com/vi/VIDEO_ID/maxresdefault.jpg",
   "tags": ["tag1", "tag2"],
   "categories": ["Music"],
-  "transcript": "전체 자막 텍스트...",
+  "transcript": "Full transcript text...",
   "transcript_language": "ko",
   "transcript_list": [
     {
-      "text": "첫 번째 자막",
+      "text": "First subtitle",
       "start": 0.0,
       "duration": 2.5
     }
@@ -124,7 +125,7 @@ http://localhost:8000/test-comments/H5TAW-0X7eQ?max_comments=50
 
 ```json
 {
-  "video_url": "https://www.youtube.com/watch?v=H5TAW-0X7eQ",
+  "video_url": "https://www.youtube.com/watch?v={VIDEO_ID}",
   "max_comments": 100
 }
 ```
@@ -133,21 +134,21 @@ http://localhost:8000/test-comments/H5TAW-0X7eQ?max_comments=50
 
 ```json
 {
-  "video_id": "H5TAW-0X7eQ",
-  "video_title": "#3 n8n 구글 뉴스 수집 완전 자동화...",
-  "comment_count": 50,
-  "fetched_count": 50,
+  "video_id": "dQw4w9WgXcQ",
+  "video_title": "Video Title",
+  "comment_count": 150,
+  "fetched_count": 100,
   "comments": [
     {
-      "author": "홍길동",
-      "text": "정말 유익한 영상입니다!",
+      "author": "User Name",
+      "text": "Great video!",
       "like_count": 15,
-      "time_text": "1주 전",
-      "author_id": "UCxxxxxx",
-      "author_thumbnail": "https://...",
+      "time_text": "1 week ago",
+      "author_id": "UCxxxxxxxxxx",
+      "author_thumbnail": "https://yt3.ggpht.com/...",
       "is_favorited": false,
       "author_is_uploader": false,
-      "reply_count": 0
+      "reply_count": 2
     }
   ]
 }
@@ -278,6 +279,19 @@ http://localhost:8000/test-comments/H5TAW-0X7eQ?max_comments=50
 
 **인기순 정렬**: 좋아요가 많은 댓글부터 수집하여 의미있는 반응을 우선 분석
 
+## 기술 스택
+
+- **FastAPI**: 고성능 비동기 웹 프레임워크
+- **yt-dlp**: YouTube 데이터 추출 (영상 정보, 자막, 댓글)
+- **VTT 포맷**: WebVTT 표준 자막 포맷 (타임스탬프 포함)
+- **Railway/AWS/GCP 지원**: 클라우드 환경에서 안정적으로 작동
+
+### 클라우드 환경 지원
+
+이 API는 **yt-dlp**를 사용하여 Railway, AWS, GCP, Azure 등 클라우드 플랫폼에서도 안정적으로 작동합니다.
+
+기존 `youtube-transcript-api`는 클라우드 IP를 차단하는 문제가 있었으나, `yt-dlp`로 전환하여 해결했습니다.
+
 ## 주의사항
 
 - 일부 영상은 자막이 없거나 추출이 제한될 수 있습니다.
@@ -287,4 +301,8 @@ http://localhost:8000/test-comments/H5TAW-0X7eQ?max_comments=50
 - 비디오당 100개 권장 (의미있는 인기 댓글 수집).
 - 배치 처리로 여러 영상 동시 수집 가능.
 - API 사용 시 유튜브의 이용 약관을 준수해야 합니다.
+
+## 라이선스
+
+MIT License
 
