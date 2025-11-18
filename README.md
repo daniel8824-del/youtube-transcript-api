@@ -292,6 +292,13 @@ http://localhost:8000/test-comments/dQw4w9WgXcQ?max_comments=50
 
 기존 `youtube-transcript-api`는 클라우드 IP를 차단하는 문제가 있었으나, `yt-dlp`로 전환하여 해결했습니다.
 
+### Rate Limiting 처리
+
+YouTube의 429 (Too Many Requests) 오류를 자동으로 처리합니다:
+- **자동 재시도**: 최대 3회 재시도 (exponential backoff)
+- **요청 딜레이**: 자막 다운로드 전 0.5초, 배치 처리 시 1초 대기
+- **HTTP 헤더 최적화**: 브라우저 요청과 유사한 헤더 사용
+
 ## Railway 배포 (Docker)
 
 Railway에서 Dockerfile을 사용하여 배포하면 mise 패키지 관리자 문제를 우회할 수 있습니다.

@@ -282,6 +282,8 @@ def get_transcript(video_id: str, languages: List[str] = ["ko", "en"]) -> Dict[s
                     subtitle_data = subtitles[lang]
                     for sub in subtitle_data:
                         if 'vtt' in sub.get('ext', ''):
+                            # 429 오류 방지를 위한 딜레이
+                            time.sleep(0.5)
                             result = download_subtitle_vtt(sub['url'])
                             if result:
                                 logger.info(f"자막 추출 성공: {lang} (수동 자막), {len(result['transcript'])}자, {result['snippet_count']}개 구간")
@@ -295,6 +297,8 @@ def get_transcript(video_id: str, languages: List[str] = ["ko", "en"]) -> Dict[s
                     caption_data = automatic_captions[lang]
                     for cap in caption_data:
                         if 'vtt' in cap.get('ext', ''):
+                            # 429 오류 방지를 위한 딜레이
+                            time.sleep(0.5)
                             result = download_subtitle_vtt(cap['url'])
                             if result:
                                 logger.info(f"자막 추출 성공: {lang} (자동 생성), {len(result['transcript'])}자, {result['snippet_count']}개 구간")
@@ -311,70 +315,111 @@ def get_transcript(video_id: str, languages: List[str] = ["ko", "en"]) -> Dict[s
         return {'transcript': None, 'language': None, 'language_code': None, 'error': str(e)}
 
 
-def download_subtitle_vtt(url: str) -> dict:
-    """VTT 형식의 자막 URL에서 텍스트 및 타임스탬프 추출"""
-    try:
-        response = requests.get(url, timeout=15)
-        response.raise_for_status()
-        
-        vtt_content = response.text
-        
-        # VTT 파싱
-        texts = []
-        transcript_list = []
-        lines = vtt_content.split('\n')
-        
-        i = 0
-        while i < len(lines):
-            line = lines[i].strip()
+def download_subtitle_vtt(url: str, max_retries: int = 3) -> dict:
+    """
+    VTT 형식의 자막 URL에서 텍스트 및 타임스탬프 추출
+    429 오류 시 exponential backoff로 재시도
+    """
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/vtt, text/plain, */*',
+        'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Referer': 'https://www.youtube.com/',
+        'Origin': 'https://www.youtube.com'
+    }
+    
+    for attempt in range(max_retries):
+        try:
+            # 재시도 시 딜레이 (exponential backoff)
+            if attempt > 0:
+                wait_time = min(2 ** attempt, 10)  # 최대 10초
+                logger.info(f"429 오류 재시도 {attempt}/{max_retries-1} - {wait_time}초 대기...")
+                time.sleep(wait_time)
             
-            # 타임스탬프 라인 찾기 (00:00:00.000 --> 00:00:02.000)
-            if '-->' in line:
-                try:
-                    # 타임스탬프 파싱
-                    time_parts = line.split('-->')
-                    start_time_str = time_parts[0].strip().split(' ')[0]  # align 제거
-                    end_time_str = time_parts[1].strip().split(' ')[0]
-                    
-                    # 시간을 초로 변환
-                    start_seconds = parse_vtt_time(start_time_str)
-                    end_seconds = parse_vtt_time(end_time_str)
-                    duration = end_seconds - start_seconds
-                    
-                    # 다음 라인들에서 자막 텍스트 추출
-                    i += 1
-                    subtitle_text = []
-                    while i < len(lines) and lines[i].strip() and '-->' not in lines[i]:
-                        text = lines[i].strip()
-                        # HTML 태그 제거 (예: <c> 태그)
-                        text = remove_vtt_tags(text)
-                        if text:
-                            subtitle_text.append(text)
+            response = requests.get(url, headers=headers, timeout=15)
+            
+            # 429 오류 처리
+            if response.status_code == 429:
+                if attempt < max_retries - 1:
+                    continue  # 재시도
+                else:
+                    logger.error(f"429 오류: 최대 재시도 횟수 초과")
+                    return None
+            
+            response.raise_for_status()
+            
+            vtt_content = response.text
+            
+            # VTT 파싱
+            texts = []
+            transcript_list = []
+            lines = vtt_content.split('\n')
+            
+            i = 0
+            while i < len(lines):
+                line = lines[i].strip()
+                
+                # 타임스탬프 라인 찾기 (00:00:00.000 --> 00:00:02.000)
+                if '-->' in line:
+                    try:
+                        # 타임스탬프 파싱
+                        time_parts = line.split('-->')
+                        start_time_str = time_parts[0].strip().split(' ')[0]  # align 제거
+                        end_time_str = time_parts[1].strip().split(' ')[0]
+                        
+                        # 시간을 초로 변환
+                        start_seconds = parse_vtt_time(start_time_str)
+                        end_seconds = parse_vtt_time(end_time_str)
+                        duration = end_seconds - start_seconds
+                        
+                        # 다음 라인들에서 자막 텍스트 추출
                         i += 1
-                    
-                    if subtitle_text:
-                        full_text = ' '.join(subtitle_text)
-                        texts.append(full_text)
-                        transcript_list.append({
-                            'text': full_text,
-                            'start': start_seconds,
-                            'duration': duration
-                        })
-                except Exception as e:
-                    logger.warning(f"VTT 라인 파싱 실패: {line} - {str(e)}")
+                        subtitle_text = []
+                        while i < len(lines) and lines[i].strip() and '-->' not in lines[i]:
+                            text = lines[i].strip()
+                            # HTML 태그 제거 (예: <c> 태그)
+                            text = remove_vtt_tags(text)
+                            if text:
+                                subtitle_text.append(text)
+                            i += 1
+                        
+                        if subtitle_text:
+                            full_text = ' '.join(subtitle_text)
+                            texts.append(full_text)
+                            transcript_list.append({
+                                'text': full_text,
+                                'start': start_seconds,
+                                'duration': duration
+                            })
+                    except Exception as e:
+                        logger.warning(f"VTT 라인 파싱 실패: {line} - {str(e)}")
+                        i += 1
+                else:
                     i += 1
+            
+            return {
+                'transcript': " ".join(texts),
+                'snippet_count': len(transcript_list),
+                'transcript_list': transcript_list
+            }
+            
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:
+                if attempt < max_retries - 1:
+                    continue  # 재시도
+                else:
+                    logger.error(f"VTT 다운로드 오류 (429): 최대 재시도 횟수 초과")
+                    return None
             else:
-                i += 1
-        
-        return {
-            'transcript': " ".join(texts),
-            'snippet_count': len(transcript_list),
-            'transcript_list': transcript_list
-        }
-        
-    except Exception as e:
-        logger.error(f"VTT 다운로드 오류: {str(e)}")
-        return None
+                logger.error(f"VTT 다운로드 HTTP 오류: {str(e)}")
+                return None
+        except Exception as e:
+            logger.error(f"VTT 다운로드 오류: {str(e)}")
+            return None
+    
+    # 모든 재시도 실패
+    logger.error(f"VTT 다운로드 실패: 최대 재시도 횟수({max_retries}) 초과")
+    return None
 
 
 def parse_vtt_time(time_str: str) -> float:
@@ -571,9 +616,9 @@ def extract_batch_videos(request: BatchVideoRequest):
                 error=str(e)
             ))
         
-        # API 제한 방지 (0.5초 대기)
+        # API 제한 방지 (자막 다운로드 포함하여 1초 대기)
         if idx < len(request.video_urls):
-            time.sleep(0.5)
+            time.sleep(1.0)
     
     logger.info(f"\n배치 처리 완료: 성공 {len([r for r in results if not r.error])}/{len(results)}")
     return results
