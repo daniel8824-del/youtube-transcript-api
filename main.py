@@ -123,6 +123,12 @@ def get_ydl_opts_base() -> dict:
         'retries': 3,
         'fragment_retries': 3,
         'socket_timeout': 30,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'web'],  # 여러 클라이언트 시도
+                'player_skip': ['webpage'],  # 웹페이지 파싱 스킵
+            }
+        },
     }
     
     # 환경 변수에서 쿠키 파일 경로 확인
@@ -275,6 +281,16 @@ def get_video_info(video_url: str, max_retries: int = 3) -> Dict[str, Any]:
                             status_code=429,
                             detail="YouTube에서 요청을 제한했습니다. 잠시 후 다시 시도해주세요."
                         )
+            elif "failed to extract" in error_msg.lower() or "player response" in error_msg.lower():
+                # yt-dlp 파싱 오류 - 재시도 또는 버전 업데이트 필요
+                if attempt < max_retries - 1:
+                    logger.warning(f"Player response 추출 실패, 재시도 중...")
+                    continue
+                else:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="YouTube 데이터 추출에 실패했습니다. yt-dlp를 최신 버전으로 업데이트하거나 잠시 후 다시 시도해주세요."
+                    )
             elif "Video unavailable" in error_msg:
                 raise HTTPException(status_code=404, detail="영상을 찾을 수 없거나 접근이 제한되었습니다.")
             else:
