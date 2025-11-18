@@ -98,11 +98,11 @@ def get_comments(video_url: str, max_comments: int = 100) -> dict:
 def print_comments(result: dict):
     """댓글 출력"""
     if not result['success']:
-        print(f"\n❌ 댓글 추출 실패: {result['error']}")
+        print(f"\n댓글 추출 실패: {result['error']}")
         return
     
     print(f"\n{'='*60}")
-    print(f"✅ 댓글 추출 성공!")
+    print(f"댓글 추출 성공!")
     print(f"{'='*60}")
     print(f"영상 ID: {result['video_id']}")
     print(f"영상 제목: {result['video_title']}")
@@ -132,7 +132,7 @@ def print_comments(result: dict):
         print(f"\n    {comment['text']}\n")
     
     print(f"{'='*60}")
-    print(f"\n📊 통계:")
+    print(f"\n통계:")
     print(f"  - 총 좋아요 수: {sum(c['like_count'] for c in result['comments']):,}개")
     print(f"  - 평균 좋아요: {sum(c['like_count'] for c in result['comments']) / len(result['comments']):.1f}개")
     print(f"  - 최고 좋아요: {max(c['like_count'] for c in result['comments']):,}개")
@@ -153,7 +153,7 @@ def main():
             break
         
         if not url:
-            print("❌ URL을 입력해주세요.\n")
+            print("URL을 입력해주세요.\n")
             continue
         
         # 댓글 개수 입력 (선택)

@@ -105,11 +105,11 @@ def get_transcript(video_id: str, languages: list = ["ko", "en"]) -> dict:
 def print_transcript(result: dict):
     """자막 출력"""
     if not result['success']:
-        print(f"\n❌ 자막 추출 실패: {result['error']}")
+        print(f"\n자막 추출 실패: {result['error']}")
         return
     
     print(f"\n{'='*60}")
-    print(f"✅ 자막 추출 성공!")
+    print(f"자막 추출 성공!")
     print(f"{'='*60}")
     print(f"언어: {result['language']} ({result['language_code']})")
     print(f"자막 유형: {'자동 생성' if result.get('is_generated') else '수동 생성'}")
@@ -150,7 +150,7 @@ def main():
             break
         
         if not url:
-            print("❌ URL을 입력해주세요.\n")
+            print("URL을 입력해주세요.\n")
             continue
         
         # 언어 입력 (선택)

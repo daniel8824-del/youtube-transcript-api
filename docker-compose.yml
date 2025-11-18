@@ -9,10 +9,21 @@ services:
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
+      # 쿠키 파일 사용 시 주석 해제:
+      # - YOUTUBE_COOKIES_FILE=/app/cookies.txt
+    volumes:
+      # 쿠키 파일 사용 시 주석 해제 (쿠키 파일이 있는 경우만):
+      # - ./cookies.txt:/app/cookies.txt:ro
+    networks:
+      - youtube-network  # n8n과 같은 네트워크
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
+
+networks:
+  youtube-network:
+    external: true  # n8n이 사용하는 기존 네트워크
 

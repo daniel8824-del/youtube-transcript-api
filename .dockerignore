@@ -1,3 +1,4 @@
+# Python
 venv/
 __pycache__/
 *.pyc
@@ -9,12 +10,42 @@ __pycache__/
 *.egg-info
 dist/
 build/
+.venv
+
+# Git
 .git
 .gitignore
+
+# 문서 및 테스트
 README.md
 test_*.py
-.DS_Store
+extract_from_csv.py
+
+# 데이터 파일
+*.csv
+*.json
+youtube_extract_*.json
+
+# 쿠키 파일 (민감한 정보)
+cookies.txt
+*.cookies
+
+# 로그
 *.log
+
+# 환경 변수
 .env
-.venv
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker
+docker-compose.yml
 
