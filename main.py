@@ -1,24 +1,21 @@
 """
-YouTube 영상 정보 + 자막 추출 API
-- 자막: youtube-transcript-api 우선 사용 (간단하고 안정적)
-- 폴백: yt-dlp 사용 (클라우드 환경 또는 youtube-transcript-api 실패 시)
+YouTube 영상 정보 + 자막 추출 API (youtube-transcript-api 최신 버전)
 """
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Response
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import yt_dlp
-import requests
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import (
+    TranscriptsDisabled, 
+    NoTranscriptFound,
+    VideoUnavailable
+)
 import logging
 import time
-import re
-import os
-import csv
-import io
-import json
-from datetime import datetime
+from langdetect import detect, LangDetectException
 
 # 로깅 설정
 logging.basicConfig(
@@ -26,20 +23,6 @@ logging.basicConfig(
     format='[%(levelname)s] %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-# youtube-transcript-api (자막 추출용)
-try:
-    from youtube_transcript_api import YouTubeTranscriptApi
-    from youtube_transcript_api._errors import (
-        TranscriptsDisabled,
-        NoTranscriptFound,
-        VideoUnavailable
-    )
-    YOUTUBE_TRANSCRIPT_AVAILABLE = True
-    logger.info("youtube-transcript-api 사용 가능 (자막 추출 우선 사용)")
-except ImportError:
-    YOUTUBE_TRANSCRIPT_AVAILABLE = False
-    logger.warning("youtube-transcript-api를 사용할 수 없습니다. yt-dlp만 사용합니다.")
 
 app = FastAPI(
     title="YouTube Video Extractor", 
@@ -60,15 +43,23 @@ app.add_middleware(
 
 class VideoRequest(BaseModel):
     video_url: str
-    languages: Optional[List[str]] = ["ko"]  # 기본값: 한국어만
+    languages: Optional[List[str]] = ["ko", "en"]
 
 class BatchVideoRequest(BaseModel):
     video_urls: List[str]
-    languages: Optional[List[str]] = ["ko"]  # 기본값: 한국어만
+    languages: Optional[List[str]] = ["ko", "en"]
 
 class CommentRequest(BaseModel):
     video_url: str
     max_comments: Optional[int] = 100  # 기본 100개
+
+class SubtitleUrlRequest(BaseModel):
+    video_url: str
+
+class SubtitleUrlResponse(BaseModel):
+    video_id: str
+    subtitle_urls: Optional[List[Dict[str, str]]] = None
+    error: Optional[str] = None
 
 class VideoResponse(BaseModel):
     # 기본 정보
@@ -116,62 +107,6 @@ class VideoResponse(BaseModel):
 
 # ===== 유틸리티 함수 =====
 
-def get_ydl_opts_base() -> dict:
-    """
-    yt-dlp 기본 옵션 (봇 감지 방지)
-    환경 변수 YOUTUBE_COOKIES_FILE이 설정되어 있으면 쿠키 사용
-    환경 변수 SCRAPERAPI_KEY가 설정되어 있으면 ScraperAPI 프록시 사용
-    """
-    opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': False,
-        'skip_download': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        'http_headers': {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
-            'Referer': 'https://www.youtube.com/',
-            'Origin': 'https://www.youtube.com'
-        },
-        'retries': 3,
-        'fragment_retries': 3,
-        'socket_timeout': 30,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android', 'ios', 'web', 'mweb'],  # 여러 클라이언트 시도
-                'player_skip': ['webpage'],  # 웹페이지 파싱 스킵
-            }
-        },
-        'extractor_retries': 3,  # 추출기 재시도
-        'no_check_certificate': False,
-        'prefer_insecure': False,
-    }
-    
-    # 환경 변수에서 쿠키 파일 경로 확인
-    cookies_file = os.getenv('YOUTUBE_COOKIES_FILE')
-    if cookies_file and os.path.exists(cookies_file):
-        opts['cookiefile'] = cookies_file
-        logger.info(f"쿠키 파일 사용: {cookies_file}")
-    
-    # ScraperAPI 프록시 설정 (환경 변수 또는 직접 설정)
-    scraperapi_key = os.getenv('SCRAPERAPI_KEY')
-    if scraperapi_key:
-        # ScraperAPI 프록시 URL 형식: http://scraperapi:API_KEY@proxy-server.scraperapi.com:8001
-        proxy_url = f"http://scraperapi:{scraperapi_key}@proxy-server.scraperapi.com:8001"
-        opts['proxy'] = proxy_url
-        logger.info("ScraperAPI 프록시 사용 (429 오류 및 봇 감지 우회)")
-    
-    return opts
-
 def extract_video_id(url: str) -> str:
     """URL에서 video_id 추출"""
     if "youtu.be/" in url:
@@ -181,28 +116,43 @@ def extract_video_id(url: str) -> str:
     else:
         return url
 
-def get_video_info(video_url: str, max_retries: int = 3) -> Dict[str, Any]:
-    """
-    yt-dlp로 영상 정보 추출
-    봇 감지 오류 시 재시도
-    """
-    for attempt in range(max_retries):
-        try:
-            ydl_opts = get_ydl_opts_base()
-            ydl_opts.update({
-                'writesubtitles': True,  # 자막 정보 포함
-                'writeautomaticsub': True,  # 자동 자막 정보 포함
-            })
-            
-            # 재시도 시 딜레이
-            if attempt > 0:
-                wait_time = min(2 ** attempt, 10)
-                logger.info(f"영상 정보 추출 재시도 {attempt}/{max_retries-1} - {wait_time}초 대기...")
-                time.sleep(wait_time)
+def detect_language(text: str) -> str:
+    """텍스트 언어 감지 (langdetect 사용)"""
+    if not text or len(text.strip()) < 3:
+        return "unknown"
+    try:
+        lang = detect(text)
+        return lang
+    except LangDetectException:
+        return "unknown"
+
+def get_video_info(video_url: str) -> Dict[str, Any]:
+    """yt-dlp로 영상 정보 추출"""
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': False,
+        'skip_download': True,
+        'writesubtitles': True,  # 자막 정보 포함
+        'writeautomaticsub': True,  # 자동 자막 정보 포함
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'http_headers': {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Accept-Encoding': 'gzip, deflate',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
+        },
+        'retries': 3,
+        'fragment_retries': 3,
+        'socket_timeout': 30,
+    }
     
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                logger.info(f"영상 정보 추출 중: {video_url}")
-                info = ydl.extract_info(video_url, download=False)
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            logger.info(f"영상 정보 추출 중: {video_url}")
+            info = ydl.extract_info(video_url, download=False)
             
             # duration을 "MM:SS" 형식으로 변환
             duration_string = None
@@ -258,7 +208,7 @@ def get_video_info(video_url: str, max_retries: int = 3) -> Dict[str, Any]:
                                 })
                                 break
             
-            result = {
+            return {
                 # 기본 정보
                 'video_id': info.get('id'),
                 'title': info.get('title'),
@@ -292,352 +242,199 @@ def get_video_info(video_url: str, max_retries: int = 3) -> Dict[str, Any]:
                 # 자막 URL (간소화)
                 'subtitle_urls': subtitle_urls if subtitle_urls else None
             }
-            return result
-                
-        except yt_dlp.utils.DownloadError as e:
-            error_msg = str(e)
-            logger.warning(f"영상 정보 추출 오류 (시도 {attempt+1}/{max_retries}): {error_msg}")
-            
-            # 봇 감지 오류 또는 429 오류 감지
-            if any(keyword in error_msg.lower() for keyword in ['bot', 'sign in', 'cookies', '429', 'too many requests', 'rate limit', 'precondition']):
-                if attempt < max_retries - 1:
-                    continue  # 재시도
-                else:
-                    logger.error(f"영상 정보 추출 실패: 최대 재시도 횟수 초과")
-                    if 'bot' in error_msg.lower() or 'sign in' in error_msg.lower():
-                        raise HTTPException(
-                            status_code=403,
-                            detail="YouTube 봇 감지로 인해 접근이 제한되었습니다. 쿠키 파일을 사용하거나 잠시 후 다시 시도해주세요."
-                        )
-                    else:
-                        raise HTTPException(
-                            status_code=429,
-                            detail="YouTube에서 요청을 제한했습니다. 잠시 후 다시 시도해주세요."
-                        )
-            elif "failed to extract" in error_msg.lower() or "player response" in error_msg.lower():
-                # yt-dlp 파싱 오류 - YouTube 봇 감지 가능성
-                if attempt < max_retries - 1:
-                    logger.warning(f"Player response 추출 실패, 재시도 중... (시도 {attempt+1}/{max_retries})")
-                    continue
-                else:
-                    # 쿠키 파일 사용 권장 메시지
-                    cookies_file = os.getenv('YOUTUBE_COOKIES_FILE')
-                    if not cookies_file:
-                        detail_msg = "YouTube 데이터 추출에 실패했습니다. YouTube 봇 감지로 인한 차단일 수 있습니다. 쿠키 파일을 사용하거나 잠시 후 다시 시도해주세요. (쿠키 파일 설정: YOUTUBE_COOKIES_FILE 환경 변수)"
-                    else:
-                        detail_msg = "YouTube 데이터 추출에 실패했습니다. 쿠키 파일을 사용 중이지만 여전히 차단되었습니다. 쿠키 파일을 갱신하거나 잠시 후 다시 시도해주세요."
-                    raise HTTPException(
-                        status_code=500,
-                        detail=detail_msg
-                    )
-            elif "Video unavailable" in error_msg:
-                raise HTTPException(status_code=404, detail="영상을 찾을 수 없거나 접근이 제한되었습니다.")
-            else:
-                # 다른 오류는 즉시 실패
-                raise HTTPException(status_code=400, detail=f"영상 정보를 가져올 수 없습니다: {error_msg}")
-                
-        except Exception as e:
-            error_msg = str(e)
-            logger.error(f"영상 정보 추출 오류: {type(e).__name__} - {error_msg}")
-            
-            # 봇 감지 관련 오류인지 확인
-            if any(keyword in error_msg.lower() for keyword in ['bot', 'sign in', 'cookies']):
-                if attempt < max_retries - 1:
-                    continue  # 재시도
-                else:
-                    raise HTTPException(
-                        status_code=403,
-                        detail="YouTube 봇 감지로 인해 접근이 제한되었습니다. 쿠키 파일을 사용하거나 잠시 후 다시 시도해주세요."
-                    )
-            else:
-                raise HTTPException(status_code=500, detail=f"서버 오류: {error_msg}")
-    
-    # 모든 재시도 실패
-    logger.error(f"영상 정보 추출 실패: 최대 재시도 횟수({max_retries}) 초과")
-    raise HTTPException(
-        status_code=403,
-        detail="YouTube 봇 감지로 인해 접근이 제한되었습니다. 쿠키 파일을 사용하거나 잠시 후 다시 시도해주세요."
-    )
-
-def get_transcript(video_id: str, languages: List[str] = ["ko"]) -> Dict[str, Any]:
-    """
-    자막 추출 (youtube-transcript-api 우선, 실패 시 yt-dlp 사용)
-    
-    전략:
-    1. youtube-transcript-api 시도 (간단하고 안정적, 로컬에서 잘 작동)
-    2. 실패 시 yt-dlp 사용 (클라우드 환경 또는 봇 감지 시)
-    """
-    logger.info(f"자막 추출 시도: {video_id}, 선호 언어: {languages}")
-    
-    # ScraperAPI 프록시 설정 (youtube-transcript-api도 requests를 사용하므로 환경 변수로 설정)
-    scraperapi_key = os.getenv('SCRAPERAPI_KEY')
-    proxy_set = False
-    if scraperapi_key:
-        proxy_url = f"http://scraperapi:{scraperapi_key}@proxy-server.scraperapi.com:8001"
-        # requests 라이브러리가 사용하는 환경 변수 설정 (youtube-transcript-api도 내부적으로 requests 사용)
-        os.environ['HTTP_PROXY'] = proxy_url
-        os.environ['HTTPS_PROXY'] = proxy_url
-        proxy_set = True
-        logger.info("ScraperAPI 프록시 사용 (youtube-transcript-api)")
-    
-    try:
-        # 1. youtube-transcript-api 시도 (우선)
-        if YOUTUBE_TRANSCRIPT_AVAILABLE:
-            try:
-                logger.info("youtube-transcript-api로 자막 추출 시도...")
-                ytt_api = YouTubeTranscriptApi()
-                transcript_list = ytt_api.list(video_id)
-                
-                # 원하는 언어의 자막 찾기
-                transcript = transcript_list.find_transcript(languages)
-                fetched_transcript = transcript.fetch()
-                
-                # 자막 텍스트 결합
-                full_text = " ".join([snippet.text for snippet in fetched_transcript])
-                
-                # transcript_list 변환 (타임스탬프 포함)
-                transcript_with_time = [
-                    {
-                        'text': snippet.text,
-                        'start': snippet.start,
-                        'duration': snippet.duration
-                    }
-                    for snippet in fetched_transcript
-                ]
-                
-                logger.info(f"자막 추출 성공 (youtube-transcript-api): {transcript.language} ({transcript.language_code}), {len(fetched_transcript)}개 구간")
-                
-                return {
-                    'transcript': full_text,
-                    'language': transcript.language,
-                    'language_code': transcript.language_code,
-                    'is_generated': transcript.is_generated,
-                    'snippet_count': len(fetched_transcript),
-                    'transcript_list': transcript_with_time
-                }
-                
-            except (NoTranscriptFound, TranscriptsDisabled, VideoUnavailable) as e:
-                logger.warning(f"youtube-transcript-api 실패: {type(e).__name__}, yt-dlp로 폴백...")
-                # yt-dlp로 폴백
-            except Exception as e:
-                logger.warning(f"youtube-transcript-api 오류: {str(e)}, yt-dlp로 폴백...")
-                # yt-dlp로 폴백
-        
-        # 2. yt-dlp로 폴백 (클라우드 환경 또는 youtube-transcript-api 실패 시)
-        logger.info("yt-dlp로 자막 추출 시도...")
-        video_url = f"https://www.youtube.com/watch?v={video_id}"
-        
-        ydl_opts = get_ydl_opts_base()
-        ydl_opts.update({
-            'writesubtitles': True,
-            'writeautomaticsub': True,
-            'subtitleslangs': languages,
-            'subtitlesformat': 'vtt',  # VTT 형식으로 받기
-        })
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(video_url, download=False)
-            
-            # 자막 데이터 추출
-            subtitles = info.get('subtitles', {})
-            automatic_captions = info.get('automatic_captions', {})
-            
-            # 사용 가능한 자막 언어 로그
-            available_langs = list(subtitles.keys()) + list(automatic_captions.keys())
-            logger.info(f"사용 가능한 자막: {', '.join(set(available_langs))}")
-            
-            # 선호 언어 순서대로 확인
-            for lang in languages:
-                # 1. 수동 자막 우선
-                if lang in subtitles:
-                    subtitle_data = subtitles[lang]
-                    for sub in subtitle_data:
-                        if 'vtt' in sub.get('ext', ''):
-                            # 429 오류 방지를 위한 딜레이
-                            time.sleep(0.5)
-                            result = download_subtitle_vtt(sub['url'])
-                            if result:
-                                logger.info(f"자막 추출 성공 (yt-dlp): {lang} (수동 자막), {len(result['transcript'])}자, {result['snippet_count']}개 구간")
-                                result['language'] = lang
-                                result['language_code'] = lang
-                                result['is_generated'] = False
-                                return result
-                
-                # 2. 자동 생성 자막
-                if lang in automatic_captions:
-                    caption_data = automatic_captions[lang]
-                    for cap in caption_data:
-                        if 'vtt' in cap.get('ext', ''):
-                            # 429 오류 방지를 위한 딜레이 (더 길게)
-                            time.sleep(1.0)  # 0.5초 → 1초로 증가
-                            result = download_subtitle_vtt(cap['url'])
-                            if result:
-                                logger.info(f"자막 추출 성공 (yt-dlp): {lang} (자동 생성), {len(result['transcript'])}자, {result['snippet_count']}개 구간")
-                                result['language'] = lang
-                                result['language_code'] = lang
-                                result['is_generated'] = True
-                                return result
-            
-            logger.warning(f"요청한 언어의 자막을 찾을 수 없음: {languages}")
-            return {'transcript': None, 'language': None, 'language_code': None, 'error': '자막 없음'}
-            
+    except yt_dlp.utils.DownloadError as e:
+        error_msg = str(e)
+        logger.error(f"다운로드 오류: {error_msg}")
+        if "Video unavailable" in error_msg:
+            raise HTTPException(status_code=404, detail="영상을 찾을 수 없거나 접근이 제한되었습니다.")
+        elif "Precondition check failed" in error_msg:
+            raise HTTPException(status_code=429, detail="YouTube에서 일시적으로 요청을 제한했습니다. 잠시 후 다시 시도해주세요.")
+        else:
+            raise HTTPException(status_code=400, detail=f"영상 정보를 가져올 수 없습니다: {error_msg}")
     except Exception as e:
-        logger.error(f"자막 추출 오류: {type(e).__name__} - {str(e)}")
-        return {'transcript': None, 'language': None, 'language_code': None, 'error': str(e)}
-    finally:
-        # 환경 변수 정리 (다른 요청에 영향을 주지 않도록)
-        if proxy_set:
-            os.environ.pop('HTTP_PROXY', None)
-            os.environ.pop('HTTPS_PROXY', None)
+        logger.error(f"영상 정보 추출 오류: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"서버 오류: {str(e)}")
 
-
-def download_subtitle_vtt(url: str, max_retries: int = 3) -> dict:
+def get_transcript(video_id: str, languages: List[str] = ["ko", "en"]) -> Dict[str, Any]:
     """
-    VTT 형식의 자막 URL에서 텍스트 및 타임스탬프 추출
-    429 오류 시 exponential backoff로 재시도
-    ScraperAPI 프록시 지원
+    youtube-transcript-api 최신 버전으로 자막 추출
+    
+    변경사항:
+    - YouTubeTranscriptApi() 인스턴스 생성
+    - list() 메서드로 사용 가능한 자막 확인
+    - find_transcript() 메서드로 원하는 언어의 자막 찾기
+    - fetch() 메서드로 자막 가져오기
     """
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/vtt, text/plain, */*',
-        'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
-        'Referer': 'https://www.youtube.com/',
-        'Origin': 'https://www.youtube.com'
-    }
+    logger.info(f"자막 추출 시도: {video_id}, 언어: {languages}")
     
-    # ScraperAPI 프록시 설정 (환경 변수)
-    proxies = None
-    scraperapi_key = os.getenv('SCRAPERAPI_KEY')
-    if scraperapi_key:
-        # ScraperAPI 프록시 URL 형식: http://scraperapi:API_KEY@proxy-server.scraperapi.com:8001
-        proxy_url = f"http://scraperapi:{scraperapi_key}@proxy-server.scraperapi.com:8001"
-        proxies = {
-            'http': proxy_url,
-            'https': proxy_url
-        }
-        logger.info("ScraperAPI 프록시 사용 (자막 다운로드)")
-    
-    for attempt in range(max_retries):
-        try:
-            # 재시도 시 딜레이 (exponential backoff)
-            if attempt > 0:
-                wait_time = min(2 ** attempt, 10)  # 최대 10초
-                logger.info(f"429 오류 재시도 {attempt}/{max_retries-1} - {wait_time}초 대기...")
-                time.sleep(wait_time)
-            
-            response = requests.get(url, headers=headers, proxies=proxies, timeout=15)
-            
-            # 429 오류 처리
-            if response.status_code == 429:
-                if attempt < max_retries - 1:
-                    continue  # 재시도
-                else:
-                    logger.error(f"429 오류: 최대 재시도 횟수 초과")
-                    return None
-            
-            response.raise_for_status()
-            
-            vtt_content = response.text
-            
-            # VTT 파싱
-            texts = []
-            transcript_list = []
-            lines = vtt_content.split('\n')
-            
-            i = 0
-            while i < len(lines):
-                line = lines[i].strip()
-                
-                # 타임스탬프 라인 찾기 (00:00:00.000 --> 00:00:02.000)
-                if '-->' in line:
-                    try:
-                        # 타임스탬프 파싱
-                        time_parts = line.split('-->')
-                        start_time_str = time_parts[0].strip().split(' ')[0]  # align 제거
-                        end_time_str = time_parts[1].strip().split(' ')[0]
-                        
-                        # 시간을 초로 변환
-                        start_seconds = parse_vtt_time(start_time_str)
-                        end_seconds = parse_vtt_time(end_time_str)
-                        duration = end_seconds - start_seconds
-                        
-                        # 다음 라인들에서 자막 텍스트 추출
-                        i += 1
-                        subtitle_text = []
-                        while i < len(lines) and lines[i].strip() and '-->' not in lines[i]:
-                            text = lines[i].strip()
-                            # HTML 태그 제거 (예: <c> 태그)
-                            text = remove_vtt_tags(text)
-                            if text:
-                                subtitle_text.append(text)
-                            i += 1
-                        
-                        if subtitle_text:
-                            full_text = ' '.join(subtitle_text)
-                            texts.append(full_text)
-                            transcript_list.append({
-                                'text': full_text,
-                                'start': start_seconds,
-                                'duration': duration
-                            })
-                    except Exception as e:
-                        logger.warning(f"VTT 라인 파싱 실패: {line} - {str(e)}")
-                        i += 1
-                else:
-                    i += 1
-            
-            return {
-                'transcript': " ".join(texts),
-                'snippet_count': len(transcript_list),
-                'transcript_list': transcript_list
-            }
-            
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 429:
-                if attempt < max_retries - 1:
-                    continue  # 재시도
-                else:
-                    logger.error(f"VTT 다운로드 오류 (429): 최대 재시도 횟수 초과")
-                    return None
-            else:
-                logger.error(f"VTT 다운로드 HTTP 오류: {str(e)}")
-                return None
-        except Exception as e:
-            logger.error(f"VTT 다운로드 오류: {str(e)}")
-            return None
-    
-    # 모든 재시도 실패
-    logger.error(f"VTT 다운로드 실패: 최대 재시도 횟수({max_retries}) 초과")
-    return None
-
-
-def parse_vtt_time(time_str: str) -> float:
-    """VTT 시간 형식을 초로 변환 (00:00:00.000)"""
     try:
-        parts = time_str.split(':')
-        hours = int(parts[0])
-        minutes = int(parts[1])
-        seconds = float(parts[2])
-        return hours * 3600 + minutes * 60 + seconds
-    except:
-        return 0.0
+        # 1. YouTubeTranscriptApi 인스턴스 생성
+        ytt_api = YouTubeTranscriptApi()
+        
+        # 2. 사용 가능한 자막 목록 가져오기
+        transcript_list = ytt_api.list(video_id)
+        
+        # 사용 가능한 자막 언어 로그
+        available_langs = []
+        for trans in transcript_list:
+            available_langs.append(f"{trans.language} ({trans.language_code})")
+        logger.info(f"사용 가능한 자막: {', '.join(available_langs)}")
+        
+        # 3. 원하는 언어의 자막 찾기
+        transcript = transcript_list.find_transcript(languages)
+        
+        logger.info(f"자막 다운로드 시도: 언어={transcript.language_code}")
+        
+        # 4. 자막 데이터 가져오기
+        fetched_transcript = transcript.fetch()
+        
+        # 5. 자막 텍스트 결합
+        full_text = " ".join([snippet.text for snippet in fetched_transcript])
+        
+        # 6. transcript_list 변환 (타임스탬프 포함)
+        transcript_with_time = [
+            {
+                'text': snippet.text,
+                'start': snippet.start,
+                'duration': snippet.duration
+            }
+            for snippet in fetched_transcript
+        ]
+        
+        logger.info(f"자막 추출 성공: {transcript.language} ({transcript.language_code}), {len(fetched_transcript)}개 구간, {len(full_text)}자")
+        
+        return {
+            'transcript': full_text,
+            'language': transcript.language,
+            'language_code': transcript.language_code,
+            'is_generated': transcript.is_generated,
+            'snippet_count': len(fetched_transcript),
+            'transcript_list': transcript_with_time
+        }
+        
+    except NoTranscriptFound:
+        # 수동 생성 자막만 시도
+        try:
+            logger.info("수동 생성 자막만 검색 중...")
+            transcript = transcript_list.find_manually_created_transcript(languages)
+            fetched_transcript = transcript.fetch()
+            full_text = " ".join([snippet.text for snippet in fetched_transcript])
+            
+            transcript_with_time = [
+                {'text': snippet.text, 'start': snippet.start, 'duration': snippet.duration}
+                for snippet in fetched_transcript
+            ]
+            
+            logger.info(f"수동 자막 추출 성공: {transcript.language}")
+            return {
+                'transcript': full_text,
+                'language': transcript.language,
+                'language_code': transcript.language_code,
+                'is_generated': False,
+                'snippet_count': len(fetched_transcript),
+                'transcript_list': transcript_with_time
+            }
+        except:
+            pass
+        
+        # 자동 생성 자막만 시도
+        try:
+            logger.info("자동 생성 자막만 검색 중...")
+            transcript = transcript_list.find_generated_transcript(languages)
+            fetched_transcript = transcript.fetch()
+            full_text = " ".join([snippet.text for snippet in fetched_transcript])
+            
+            transcript_with_time = [
+                {'text': snippet.text, 'start': snippet.start, 'duration': snippet.duration}
+                for snippet in fetched_transcript
+            ]
+            
+            logger.info(f"자동 자막 추출 성공: {transcript.language}")
+            return {
+                'transcript': full_text,
+                'language': transcript.language,
+                'language_code': transcript.language_code,
+                'is_generated': True,
+                'snippet_count': len(fetched_transcript),
+                'transcript_list': transcript_with_time
+            }
+        except Exception as e:
+            logger.warning(f"자막 없음: {video_id}")
+            return {'transcript': None, 'language': None, 'language_code': None, 'error': '자막 없음'}
+    
+    except TranscriptsDisabled:
+        logger.warning(f"자막 비활성화: {video_id}")
+        return {'transcript': None, 'language': None, 'language_code': None, 'error': '자막 비활성화'}
+    
+    except VideoUnavailable:
+        logger.error(f"영상 접근 불가: {video_id}")
+        return {'transcript': None, 'language': None, 'language_code': None, 'error': '영상 접근 불가'}
+    
+    except Exception as e:
+        logger.error(f"자막 추출 중 오류: {type(e).__name__} - {str(e)}")
+        return {'transcript': None, 'language': None, 'language_code': None, 'error': str(e)}
 
-
-def remove_vtt_tags(text: str) -> str:
-    """VTT 태그 제거 (예: <c>, <00:00:01.234> 등)"""
-    # <00:00:01.234> 형식의 타임스탬프 제거
-    text = re.sub(r'<\d+:\d+:\d+\.\d+>', '', text)
-    # <c> 태그 제거
-    text = re.sub(r'</?c[^>]*>', '', text)
-    # 기타 HTML 태그 제거
-    text = re.sub(r'<[^>]+>', '', text)
-    return text.strip()
+def get_language_group(language_code: str) -> str:
+    """언어 코드를 언어 그룹으로 매핑"""
+    if language_code == 'ko':
+        return 'korean'
+    elif language_code == 'ja':
+        return 'japanese'
+    elif language_code.startswith('zh'):
+        return 'chinese'
+    elif language_code in ['th', 'id', 'vi']:
+        return 'southeast_asian'
+    elif language_code in ['en', 'fr', 'de']:
+        return 'western'
+    elif language_code in ['es', 'pt']:
+        return 'latin'
+    else:
+        return 'others'
 
 def get_comments(video_url: str, max_comments: int = 100) -> Dict[str, Any]:
-    """yt-dlp로 댓글 추출 (인기순)"""
+    """yt-dlp로 댓글 추출 (인기순) + 언어 감지"""
     
-    ydl_opts = get_ydl_opts_base()
-    ydl_opts.update({
+    # 먼저 영상 정보를 가져와서 전체 댓글 수 확인
+    try:
+        video_info = get_video_info(video_url)
+        total_comment_count = video_info.get('comment_count')
+        video_like_count = video_info.get('like_count')
+        video_tags = video_info.get('tags')
+        video_categories = video_info.get('categories')
+        upload_date_raw = video_info.get('upload_date')
+        video_description = video_info.get('description')
+        video_link = video_info.get('url')
+        channel_name = video_info.get('channel')
+        channel_link = video_info.get('channel_url')
+        video_views = video_info.get('view_count')
+        video_length = video_info.get('duration_string')  # "MM:SS" 형식
+        video_thumbnail = video_info.get('thumbnail')
+        
+        # 업로드 날짜 형식 변환: "20251113" -> "2025-11-13"
+        upload_date_formatted = None
+        if upload_date_raw and len(str(upload_date_raw)) == 8:
+            date_str = str(upload_date_raw)
+            upload_date_formatted = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+    except Exception as e:
+        logger.warning(f"영상 정보 추출 실패, 댓글만 추출: {str(e)}")
+        total_comment_count = None
+        video_like_count = None
+        video_tags = None
+        video_categories = None
+        upload_date_formatted = None
+        video_description = None
+        video_link = None
+        channel_name = None
+        channel_link = None
+        video_views = None
+        video_length = None
+        video_thumbnail = None
+    
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': False,
+        'skip_download': True,
         'getcomments': True,  # 댓글 가져오기
         'extractor_args': {
             'youtube': {
@@ -645,7 +442,18 @@ def get_comments(video_url: str, max_comments: int = 100) -> Dict[str, Any]:
                 'comment_sort': ['top']  # 인기순 정렬
             }
         },
-    })
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'http_headers': {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Accept-Encoding': 'gzip, deflate',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
+        },
+        'retries': 3,
+        'socket_timeout': 30,
+    }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -657,35 +465,152 @@ def get_comments(video_url: str, max_comments: int = 100) -> Dict[str, Any]:
             
             if info.get('comments'):
                 for comment in info['comments']:
+                    text = comment.get('text', '')
+                    
+                    # 언어 감지
+                    detected_lang = detect_language(text)
+                    # 언어 그룹 매핑
+                    language_group = get_language_group(detected_lang)
+                    
                     comments.append({
                         'author': comment.get('author'),
-                        'text': comment.get('text'),
+                        'text': text,
                         'like_count': comment.get('like_count', 0),
                         'time_text': comment.get('time_text'),
                         'author_id': comment.get('author_id'),
                         'author_thumbnail': comment.get('author_thumbnail'),
                         'is_favorited': comment.get('is_favorited', False),
                         'author_is_uploader': comment.get('author_is_uploader', False),
-                        'reply_count': comment.get('_reply_continuation', 0) if comment.get('_reply_continuation') else 0
+                        'reply_count': comment.get('_reply_continuation', 0) if comment.get('_reply_continuation') else 0,
+                        'language': detected_lang,  # 언어 코드 (ko, ja, en 등)
+                        'language_group': language_group  # 언어 그룹 (korean, japanese, chinese 등)
                     })
                     if len(comments) >= max_comments:
                         break
             
-            logger.info(f"댓글 추출 완료: {len(comments)}개")
+            # 언어별 분류 (6개 그룹)
+            # 1. 한국어
+            korean_comments = [c for c in comments if c['language'] == 'ko']
+            # 2. 일본어
+            japanese_comments = [c for c in comments if c['language'] == 'ja']
+            # 3. 중국어 (zh, zh-cn, zh-tw 등)
+            chinese_comments = [c for c in comments if c['language'].startswith('zh')]
+            # 4. 동남아시아 (태국어, 인도네시아어, 베트남어)
+            southeast_asian_langs = ['th', 'id', 'vi']
+            southeast_asian_comments = [c for c in comments if c['language'] in southeast_asian_langs]
+            # 5. 서구권 (영어, 프랑스어, 독일어)
+            western_langs = ['en', 'fr', 'de']
+            western_comments = [c for c in comments if c['language'] in western_langs]
+            # 6. 라틴권 (스페인어, 포르투갈어)
+            latin_langs = ['es', 'pt']
+            latin_comments = [c for c in comments if c['language'] in latin_langs]
+            # 기타 언어
+            all_classified_langs = ['ko', 'ja'] + southeast_asian_langs + western_langs + latin_langs
+            other_comments = [c for c in comments if c['language'] not in all_classified_langs and not c['language'].startswith('zh')]
+            
+            logger.info(f"댓글 추출 완료: 총 {len(comments)}개 (한국어: {len(korean_comments)}, 일본어: {len(japanese_comments)}, 중국어: {len(chinese_comments)}, 동남아시아: {len(southeast_asian_comments)}, 서구권: {len(western_comments)}, 라틴권: {len(latin_comments)}, 기타: {len(other_comments)})")
             
             return {
-                'video_id': info.get('id'),
-                'video_title': info.get('title'),
-                'comment_count': info.get('comment_count', 0),
-                'comments': comments,
-                'fetched_count': len(comments)
+                'videoId': info.get('id'),
+                'title': info.get('title'),
+                'description': video_description,
+                'link': video_link,
+                'channelName': channel_name,
+                'channelLink': channel_link,
+                'views': video_views,
+                'likes': video_like_count,
+                'comments': total_comment_count,
+                'length': video_length,
+                'thumbnail': video_thumbnail,
+                'upload_date': upload_date_formatted,  # 업로드 날짜 (2025-11-13 형식)
+                'tags': video_tags,  # get_video_info에서 가져온 태그
+                'categories': video_categories,  # get_video_info에서 가져온 카테고리
+                'fetched_count': len(comments),
+                'language_stats': {
+                    'korean': len(korean_comments),
+                    'japanese': len(japanese_comments),
+                    'chinese': len(chinese_comments),
+                    'southeast_asian': len(southeast_asian_comments),
+                    'western': len(western_comments),
+                    'latin': len(latin_comments),
+                    'others': len(other_comments)
+                },
+                'all_comments': comments,  # 모든 댓글 (언어 정보 포함)
+                'korean_comments': korean_comments,  # 한국어 댓글만
+                'japanese_comments': japanese_comments,  # 일본어 댓글만
+                'chinese_comments': chinese_comments,  # 중국어 댓글만
+                'southeast_asian_comments': southeast_asian_comments,  # 동남아시아 댓글만
+                'western_comments': western_comments,  # 서구권 댓글만
+                'latin_comments': latin_comments,  # 라틴권 댓글만
+                'other_comments': other_comments  # 기타 언어 댓글
             }
             
     except Exception as e:
         logger.error(f"댓글 추출 오류: {str(e)}")
         raise HTTPException(status_code=500, detail=f"댓글 추출 실패: {str(e)}")
 
-def extract_video_data(video_url: str, languages: List[str] = ["ko"]) -> VideoResponse:
+def get_subtitle_url_only(video_url: str) -> SubtitleUrlResponse:
+    """자막 URL만 추출 (한국어 VTT만)"""
+    logger.info(f"자막 URL 추출 시작: {video_url}")
+    
+    try:
+        # 영상 정보 추출
+        video_info = get_video_info(video_url)
+        video_id = video_info.get('video_id')
+        
+        # 한국어 VTT 자막 URL만 필터링
+        subtitle_urls = []
+        target_lang = 'ko'  # 한국어만
+        
+        # 수동 자막에서 한국어 VTT 찾기
+        if video_info.get('subtitle_urls'):
+            for sub in video_info['subtitle_urls']:
+                if sub.get('language') == target_lang and sub.get('ext') == 'vtt':
+                    subtitle_urls.append(sub)
+                    logger.info(f"한국어 VTT 자막 URL 찾음: {target_lang}")
+                    break
+        
+        # 자동 생성 자막에서 한국어 VTT 찾기 (수동 자막이 없을 경우)
+        if not subtitle_urls:
+            # 다시 영상 정보를 가져와서 자동 생성 자막 확인
+            ydl_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'extract_flat': False,
+                'skip_download': True,
+                'writesubtitles': True,
+                'writeautomaticsub': True,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(video_url, download=False)
+                if info.get('automatic_captions') and target_lang in info['automatic_captions']:
+                    subs = info['automatic_captions'][target_lang]
+                    vtt_sub = next((s for s in subs if s.get('ext') == 'vtt'), None)
+                    if vtt_sub:
+                        subtitle_urls.append({
+                            'language': target_lang,
+                            'ext': 'vtt',
+                            'url': vtt_sub.get('url')
+                        })
+                        logger.info(f"한국어 자동 생성 VTT 자막 URL 찾음: {target_lang}")
+        
+        logger.info(f"자막 URL 추출 완료: {video_id}, 자막 개수: {len(subtitle_urls)}")
+        
+        return SubtitleUrlResponse(
+            video_id=video_id,
+            subtitle_urls=subtitle_urls if subtitle_urls else None,
+            error=None
+        )
+    except Exception as e:
+        logger.error(f"자막 URL 추출 실패: {str(e)}")
+        video_id = extract_video_id(video_url)
+        return SubtitleUrlResponse(
+            video_id=video_id,
+            subtitle_urls=None,
+            error=str(e)
+        )
+
+def extract_video_data(video_url: str, languages: List[str] = ["ko", "en"]) -> VideoResponse:
     """영상 정보 + 자막 추출"""
     logger.info(f"영상 데이터 추출 시작: {video_url}")
     
@@ -721,16 +646,16 @@ def root():
             "자막 텍스트 추출 (타임스탬프 포함)",
             "자막 URL 제공 (VTT 우선)",
             "댓글 추출 (작성자, 내용, 좋아요 수)",
-            "배치 처리 지원 (최대 200개)",
-            "CSV 파일 업로드 지원"
+            "배치 처리 지원 (최대 50개)"
         ],
         "endpoints": {
             "POST /extract": "단일 영상 추출 (메타데이터 + 자막)",
-            "POST /transcript": "여러 영상 일괄 추출 (최대 200개)",
-            "POST /transcript/csv": "CSV 파일에서 URL 읽어 일괄 추출 (최대 200개)",
-            "POST /transcript/csv-save": "CSV 파일에서 URL 읽어 추출 후 파일로 다운로드 (JSON/CSV)",
-            "POST /comments": "댓글 추출 (최대 지정 개수)",
+            "POST /subtitle-url": "자막 URL만 추출 (한국어 VTT만, 가장 가벼움)",
+            "GET /subtitle-url/{video_id}": "자막 URL만 추출 (GET 방식, video_id로 직접 접근)",
+            "POST /transcript": "여러 영상 일괄 추출 (최대 50개)",
+            "POST /comments": "댓글 추출 (언어 감지 및 분류)",
             "GET /test/{video_id}": "영상 정보 간편 테스트",
+            "GET /test-subtitle-url/{video_id}": "자막 URL 간편 테스트",
             "GET /test-comments/{video_id}": "댓글 간편 테스트"
         },
         "documentation": {
@@ -794,262 +719,53 @@ def extract_batch_videos(request: BatchVideoRequest):
                 error=str(e)
             ))
         
-        # API 제한 방지 (429 오류 대응 - 더 긴 딜레이)
+        # API 제한 방지 (0.5초 대기)
         if idx < len(request.video_urls):
-            # 100개 이상: 5초, 50개 이상: 3초, 그 외: 2초 대기
-            if len(request.video_urls) >= 100:
-                delay = 5.0  # 100개 이상은 5초 대기 (429 오류 방지)
-            elif len(request.video_urls) > 50:
-                delay = 3.0
-            else:
-                delay = 2.0
-            time.sleep(delay)
+            time.sleep(0.5)
     
     logger.info(f"\n배치 처리 완료: 성공 {len([r for r in results if not r.error])}/{len(results)}")
     return results
 
-@app.post("/transcript/csv", response_model=List[VideoResponse])
-async def extract_batch_from_csv(
-    file: UploadFile = File(...),
-    languages: Optional[str] = "ko,en"
-):
-    """
-    CSV 파일에서 URL을 읽어 일괄 추출 (최대 200개)
-    
-    CSV 형식:
-    - 첫 번째 컬럼이 URL 또는 video_id
-    - 헤더 행은 자동으로 건너뜀
-    
-    예시 CSV:
-    ```
-    url
-    https://www.youtube.com/watch?v=VIDEO_ID_1
-    https://www.youtube.com/watch?v=VIDEO_ID_2
-    VIDEO_ID_3
-    ```
-    
-    주의사항:
-    - 100개 처리 시 약 5분 소요 (영상당 3초 대기)
-    - youtube-transcript-api 사용 시 봇 감지 가능성 낮음 (로컬 IP)
-    - 클라우드 환경에서는 yt-dlp로 자동 폴백
-    """
-    try:
-        # CSV 파일 읽기
-        contents = await file.read()
-        csv_content = contents.decode('utf-8')
-        csv_reader = csv.reader(io.StringIO(csv_content))
-        
-        # URL 추출
-        urls = []
-        for row_idx, row in enumerate(csv_reader):
-            if row_idx == 0:
-                # 헤더 행 건너뛰기
-                continue
-            if row and len(row) > 0:
-                url = row[0].strip()
-                if url and ('youtube.com' in url or 'youtu.be' in url or len(url) == 11):
-                    # URL 형식이 아니면 video_id로 간주
-                    if not url.startswith('http'):
-                        url = f"https://www.youtube.com/watch?v={url}"
-                    urls.append(url)
-        
-        if not urls:
-            raise HTTPException(status_code=400, detail="CSV 파일에서 유효한 URL을 찾을 수 없습니다.")
-        
-        if len(urls) > 200:
-            raise HTTPException(status_code=400, detail=f"최대 200개까지만 처리 가능합니다. 현재 {len(urls)}개입니다.")
-        
-        logger.info(f"CSV 파일에서 {len(urls)}개 URL 추출")
-        
-        # 언어 파싱
-        lang_list = [lang.strip() for lang in languages.split(",")] if languages else ["ko", "en"]
-        
-        # 배치 처리
-        results = []
-        for idx, url in enumerate(urls, 1):
-            logger.info(f"\n{'='*60}")
-            logger.info(f"처리 중: {idx}/{len(urls)}")
-            logger.info(f"{'='*60}")
-            
-            try:
-                result = extract_video_data(url, lang_list)
-                results.append(result)
-            except Exception as e:
-                logger.error(f"영상 처리 실패: {url} - {str(e)}")
-                results.append(VideoResponse(
-                    video_id=extract_video_id(url),
-                    title="처리 실패",
-                    url=url,
-                    error=str(e)
-                ))
-            
-            # API 제한 방지 (대량 처리 시 더 긴 딜레이)
-            if idx < len(urls):
-                # 100개 이상: 3초, 50개 이상: 2초, 그 외: 1초 대기
-                if len(urls) >= 100:
-                    delay = 3.0  # 100개 이상은 3초 대기 (봇 감지 방지)
-                elif len(urls) > 50:
-                    delay = 2.0
-                else:
-                    delay = 1.0
-                time.sleep(delay)
-        
-        logger.info(f"\nCSV 배치 처리 완료: 성공 {len([r for r in results if not r.error])}/{len(results)}")
-        return results
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"CSV 파일 처리 오류: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"CSV 파일 처리 실패: {str(e)}")
-
-@app.post("/transcript/csv-save")
-async def extract_batch_from_csv_and_save(
-    file: UploadFile = File(...),
-    languages: Optional[str] = "ko,en",
-    format: Optional[str] = "json"  # json 또는 csv
-):
-    """
-    CSV 파일에서 URL을 읽어 일괄 추출 후 파일로 저장
-    
-    - **file**: CSV 파일 (URL 목록)
-    - **languages**: 언어 코드 (쉼표로 구분, 기본값: "ko,en")
-    - **format**: 저장 형식 ("json" 또는 "csv", 기본값: "json")
-    
-    반환: 추출된 데이터가 포함된 파일 다운로드
-    """
-    try:
-        # CSV 파일 읽기
-        contents = await file.read()
-        csv_content = contents.decode('utf-8')
-        csv_reader = csv.reader(io.StringIO(csv_content))
-        
-        # URL 추출
-        urls = []
-        for row_idx, row in enumerate(csv_reader):
-            if row_idx == 0:
-                continue
-            if row and len(row) > 0:
-                url = row[0].strip()
-                if url and ('youtube.com' in url or 'youtu.be' in url or len(url) == 11):
-                    if not url.startswith('http'):
-                        url = f"https://www.youtube.com/watch?v={url}"
-                    urls.append(url)
-        
-        if not urls:
-            raise HTTPException(status_code=400, detail="CSV 파일에서 유효한 URL을 찾을 수 없습니다.")
-        
-        if len(urls) > 200:
-            raise HTTPException(status_code=400, detail=f"최대 200개까지만 처리 가능합니다. 현재 {len(urls)}개입니다.")
-        
-        logger.info(f"CSV 파일에서 {len(urls)}개 URL 추출")
-        
-        # 언어 파싱
-        lang_list = [lang.strip() for lang in languages.split(",")] if languages else ["ko", "en"]
-        
-        # 배치 처리
-        results = []
-        for idx, url in enumerate(urls, 1):
-            logger.info(f"\n{'='*60}")
-            logger.info(f"처리 중: {idx}/{len(urls)}")
-            logger.info(f"{'='*60}")
-            
-            try:
-                result = extract_video_data(url, lang_list)
-                results.append(result)
-            except Exception as e:
-                logger.error(f"영상 처리 실패: {url} - {str(e)}")
-                results.append(VideoResponse(
-                    video_id=extract_video_id(url),
-                    title="처리 실패",
-                    url=url,
-                    error=str(e)
-                ))
-            
-            # API 제한 방지 (429 오류 대응 - 더 긴 딜레이)
-            if idx < len(urls):
-                if len(urls) >= 100:
-                    delay = 5.0  # 100개 이상: 5초 대기 (429 오류 방지)
-                elif len(urls) > 50:
-                    delay = 3.0
-                else:
-                    delay = 2.0
-                time.sleep(delay)
-        
-        logger.info(f"\nCSV 배치 처리 완료: 성공 {len([r for r in results if not r.error])}/{len(results)}")
-        
-        # 파일로 저장
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        if format.lower() == "csv":
-            # CSV 형식으로 저장
-            output = io.StringIO()
-            writer = csv.writer(output)
-            
-            # 헤더 작성
-            writer.writerow([
-                'video_id', 'title', 'url', 'view_count', 'like_count', 'comment_count',
-                'channel', 'channel_follower_count', 'upload_date', 'duration_string',
-                'transcript', 'transcript_language', 'transcript_snippet_count'
-            ])
-            
-            # 데이터 작성
-            for result in results:
-                writer.writerow([
-                    result.video_id,
-                    result.title,
-                    result.url,
-                    result.view_count,
-                    result.like_count,
-                    result.comment_count,
-                    result.channel,
-                    result.channel_follower_count,
-                    result.upload_date,
-                    result.duration_string,
-                    result.transcript[:500] if result.transcript else "",  # 처음 500자만
-                    result.transcript_language,
-                    result.snippet_count
-                ])
-            
-            output.seek(0)
-            return StreamingResponse(
-                io.BytesIO(output.getvalue().encode('utf-8-sig')),  # BOM 추가 (Excel 호환)
-                media_type="text/csv",
-                headers={
-                    "Content-Disposition": f"attachment; filename=youtube_extract_{timestamp}.csv"
-                }
-            )
-        else:
-            # JSON 형식으로 저장
-            json_data = json.dumps([result.dict() for result in results], ensure_ascii=False, indent=2)
-            return Response(
-                content=json_data.encode('utf-8'),
-                media_type="application/json",
-                headers={
-                    "Content-Disposition": f"attachment; filename=youtube_extract_{timestamp}.json"
-                }
-            )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"CSV 파일 처리 오류: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"CSV 파일 처리 실패: {str(e)}")
-
 @app.post("/comments")
 def extract_comments(request: CommentRequest):
     """
-    댓글 추출 (인기순)
+    댓글 추출 (인기순) + 언어 감지 및 분류
     
     - **video_url**: 유튜브 영상 URL
     - **max_comments**: 최대 댓글 수 (기본값: 100, 제한 없음)
     
     특징:
     - 인기순(좋아요 많은 순)으로 정렬
+    - 언어 자동 감지 (langdetect 사용)
+    - 6개 언어 그룹별로 자동 분류
     - 비디오당 100개 권장 (빠르고 의미있는 댓글 수집)
-    - 배치 처리로 여러 영상 동시 수집 가능
     
     반환 정보:
+    - video_id: 영상 ID
+    - video_title: 영상 제목
+    - comment_count: 전체 댓글 수
+    - like_count: 영상 좋아요 수
+    - tags: 태그 목록
+    - categories: 카테고리 목록
+    - fetched_count: 실제 가져온 댓글 수
+    - language_stats: 언어별 통계 (6개 그룹)
+      - korean: 한국어
+      - japanese: 일본어
+      - chinese: 중국어
+      - southeast_asian: 동남아시아 (태국어, 인도네시아어, 베트남어)
+      - western: 서구권 (영어, 프랑스어, 독일어)
+      - latin: 라틴권 (스페인어, 포르투갈어)
+      - others: 기타 언어
+    - all_comments: 모든 댓글 (언어 정보 포함)
+    - korean_comments: 한국어 댓글만
+    - japanese_comments: 일본어 댓글만
+    - chinese_comments: 중국어 댓글만
+    - southeast_asian_comments: 동남아시아 댓글만
+    - western_comments: 서구권 댓글만
+    - latin_comments: 라틴권 댓글만
+    - other_comments: 기타 언어 댓글
+    
+    각 댓글 정보:
     - author: 작성자 이름
     - text: 댓글 내용
     - like_count: 좋아요 수 (인기순 정렬 기준)
@@ -1058,6 +774,9 @@ def extract_comments(request: CommentRequest):
     - author_thumbnail: 작성자 프로필 이미지
     - is_favorited: 고정 댓글 여부
     - author_is_uploader: 채널 주인 댓글 여부
+    - reply_count: 답글 수
+    - language: 감지된 언어 코드 (ko, en, ja, es 등)
+    - language_group: 언어 그룹 (korean, japanese, chinese, southeast_asian, western, latin, others)
     """
     try:
         result = get_comments(request.video_url, request.max_comments)
@@ -1090,6 +809,89 @@ def test_video(video_id: str, languages: str = "ko,en"):
         logger.error(f"테스트 실패: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/subtitle-url", response_model=SubtitleUrlResponse)
+def get_subtitle_url(request: SubtitleUrlRequest):
+    """
+    자막 URL만 추출 (한국어 VTT만, 가장 가벼운 엔드포인트)
+    
+    - **video_url**: 유튜브 영상 URL
+    
+    반환:
+    - video_id: 영상 ID
+    - subtitle_urls: 한국어 VTT 자막 URL 리스트 (없으면 null)
+    - error: 에러 메시지 (있을 경우)
+    
+    예시 응답:
+    ```json
+    {
+        "video_id": "H5TAW-0X7eQ",
+        "subtitle_urls": [
+            {
+                "language": "ko",
+                "ext": "vtt",
+                "url": "https://www.youtube.com/api/timedtext?..."
+            }
+        ],
+        "error": null
+    }
+    ```
+    """
+    try:
+        # 차단 방지를 위한 최소 대기 시간
+        time.sleep(0.5)
+        return get_subtitle_url_only(request.video_url)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"자막 URL 추출 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/subtitle-url/{video_id}", response_model=SubtitleUrlResponse)
+def get_subtitle_url_by_id(video_id: str):
+    """
+    자막 URL만 추출 (GET 방식, video_id로 직접 접근)
+    
+    - **video_id**: 유튜브 비디오 ID (11자리)
+    
+    반환:
+    - video_id: 영상 ID
+    - subtitle_urls: 한국어 VTT 자막 URL 리스트
+    - error: 에러 메시지 (있을 경우)
+    
+    예시: http://localhost:8000/subtitle-url/H5TAW-0X7eQ
+    """
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    
+    try:
+        # 차단 방지를 위한 최소 대기 시간
+        time.sleep(0.5)
+        return get_subtitle_url_only(url)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"자막 URL 추출 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/test-subtitle-url/{video_id}")
+def test_subtitle_url(video_id: str):
+    """
+    자막 URL 테스트 (브라우저에서 접근 가능)
+    
+    - **video_id**: 유튜브 비디오 ID (11자리)
+    
+    예시: http://localhost:8000/test-subtitle-url/H5TAW-0X7eQ
+    """
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    
+    try:
+        result = get_subtitle_url_only(url)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"자막 URL 테스트 실패: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/test-comments/{video_id}")
 def test_comments(video_id: str, max_comments: int = 100):
     """
@@ -1116,7 +918,14 @@ def test_comments(video_id: str, max_comments: int = 100):
 if __name__ == "__main__":
     import uvicorn
     logger.info("YouTube Video Extractor API v2.1 시작...")
-    logger.info("자막 텍스트 + 자막 URL + 댓글 제공")
-    logger.info("엔드포인트: /extract (단일), /transcript (여러개), /comments (댓글)")
-    logger.info("테스트: /test/{id} (영상), /test-comments/{id} (댓글)")
+    logger.info("자막 텍스트 + 자막 URL + 댓글 제공 (언어 감지)")
+    logger.info("엔드포인트:")
+    logger.info("  - POST /subtitle-url (자막 URL만, 한국어 VTT)")
+    logger.info("  - POST /extract (단일 영상, 메타데이터 + 자막)")
+    logger.info("  - POST /transcript (여러개 일괄 처리)")
+    logger.info("  - POST /comments (댓글 추출, 언어 감지 및 분류)")
+    logger.info("테스트:")
+    logger.info("  - GET /test-subtitle-url/{id} (자막 URL만)")
+    logger.info("  - GET /test/{id} (영상 정보)")
+    logger.info("  - GET /test-comments/{id} (댓글)")
     uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -1,29 +1,39 @@
 version: '3.8'
 
 services:
-  youtube-extractor:
+  youtube-api:
     build: .
-    container_name: youtube-extractor
+    container_name: youtube-api
     ports:
       - "8000:8000"
-    restart: unless-stopped
+    volumes:
+      - ./main.py:/app/main.py  # 코드 변경 시 자동 반영 (선택사항)
     environment:
       - PYTHONUNBUFFERED=1
-      # 쿠키 파일 사용 시 주석 해제:
-      # - YOUTUBE_COOKIES_FILE=/app/cookies.txt
-    volumes:
-      # 쿠키 파일 사용 시 주석 해제 (쿠키 파일이 있는 경우만):
-      # - ./cookies.txt:/app/cookies.txt:ro
+    restart: unless-stopped
     networks:
-      - youtube-network  # n8n과 같은 네트워크
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
+      - n8n-network
+
+  # n8n이 이미 실행 중이라면 아래 설정은 주석 처리하세요
+  # n8n:
+  #   image: n8nio/n8n:latest
+  #   container_name: n8n
+  #   ports:
+  #     - "5678:5678"
+  #   environment:
+  #     - N8N_BASIC_AUTH_ACTIVE=true
+  #     - N8N_BASIC_AUTH_USER=admin
+  #     - N8N_BASIC_AUTH_PASSWORD=password
+  #   volumes:
+  #     - n8n_data:/home/node/.n8n
+  #   restart: unless-stopped
+  #   networks:
+  #     - n8n-network
 
 networks:
-  youtube-network:
-    external: true  # n8n이 사용하는 기존 네트워크
+  n8n-network:
+    name: n8n-network
+    external: false  # 이미 존재하면 true로 변경
 
+# volumes:
+#   n8n_data:

@@ -38,7 +38,5 @@ Thumbs.db
 # Logs
 *.log
 
-# Cookies (민감한 정보)
-cookies.txt
-*.cookies
-
+# Proxy files (not for public repository)
+main_proxy.py

@@ -1,0 +1,25 @@
+# 도커 파일 생성
+Dockerfile
+docker-compose
+
+# 도커 이미지 빌드
+docker build -t youtube-api .
+
+# 네트워크 생성
+docker network create youtube-net
+
+# YouTube API 컨테이너 실행
+docker run -d \
+  --name youtube-api \
+  --network youtube-net \
+  -p 8000:8000 \
+  youtube-api
+
+# n8n 컨테이너를 같은 네트워크에 연결
+docker network connect youtube-net n8n
+
+# 코드 변경 후 재시작
+# 컨테이너 삭제 → 재빌드 → 재실행
+docker build -t youtube-api .
+docker rm -f youtube-api
+docker run -d --name youtube-api --network youtube-net -p 8000:8000 youtube-api
