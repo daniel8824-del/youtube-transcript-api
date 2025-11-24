@@ -12,7 +12,7 @@ services:
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
     networks:
-      - n8n-network
+      - youtube-net
 
   # n8n이 이미 실행 중이라면 아래 설정은 주석 처리하세요
   # n8n:
@@ -28,11 +28,11 @@ services:
   #     - n8n_data:/home/node/.n8n
   #   restart: unless-stopped
   #   networks:
-  #     - n8n-network
+  #     - youtube-net
 
 networks:
-  n8n-network:
-    name: n8n-network
+  youtube-net:
+    name: youtube-net
     external: false  # 이미 존재하면 true로 변경
 
 # volumes:
